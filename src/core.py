@@ -1,9 +1,9 @@
+# String manipulation
 import re
-
+# Numerical
 import numpy as np
-
 # Local repo
-from utilities.numerical import divide0, iterative_mean
+from utilities.numerical import divide0
 
 
 def _compute_tree_paths(estimator, i_tree, results, lock):
