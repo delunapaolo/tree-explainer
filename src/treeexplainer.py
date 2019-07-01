@@ -1,5 +1,4 @@
 # System
-import sys
 import threading
 from joblib import Parallel, delayed
 from warnings import warn
@@ -7,12 +6,11 @@ from warnings import warn
 # Numerical
 import numpy as np
 import pandas as pd
-from scipy.stats import sem
 from scipy.stats import binom_test
 
 # Graphical
 from matplotlib import pyplot as plt
-import matplotlib as mpl
+from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 
 # Local repo
@@ -20,7 +18,6 @@ from core import validate_model_type, validate_model_is_trained
 from core import _compute_tree_paths, _compute_feature_contributions_from_tree
 from utilities.numerical import divide0
 from utilities.visualization import adjust_spines
-from utilities.lists import natural_sort
 
 
 ################################################################################
@@ -28,6 +25,9 @@ class TreeExplainer(object):
     def __init__(self, model, feature_names=None, target_names=None,
                  n_jobs=-1, verbose=False):
         """
+        The class is instantiated by passing the model, and the names of features
+        and targets in the data.
+
         :param model: The input model to explain.
         :param feature_names: [list] Name of each feature. Used for plots,
             output DataFrames and printing.
@@ -81,17 +81,30 @@ class TreeExplainer(object):
         self.feature_depth = results['feature_depth']
         self.value_threshold = results['value_threshold']
         self.no_of_nodes = results['no_of_nodes']
+        # Initialize all other TreeExplainer's attributes
+        self.predictions = None
+        self.prediction_probabilities = None
+        self.contributions = None
+        self.conditional_contributions = None
+        self.min_depth_frame = None
+        self.min_depth_frame_summary = None
+        self.importance_frame = None
 
 
     def explain(self, X_test, compute_conditional_contribution=False,
                 n_jobs=-1, verbose=False):
-        """Main method to explain the provided model. It computes the feature
-        contributions , such that predictions ≈ target_frequency_at_root +
-        feature_contributions.
+        """Main method to explain the provided predictions of the model. It
+        computes feature contributions, such that:
+        predictions ≈ target_frequency_at_root + feature_contributions.
 
-        :param X_test: [ndarray or DataFrame] Data on which to test feature
+        REFERENCE: This function is based on _predict_forest in the python
+        package treeinterpreter.
+        SOURCE: https://github.com/andosa/treeinterpreter/blob/master/treeinterpreter/treeinterpreter.py
+
+        :param X_test: [numpy or DataFrame] Data on which to test feature
             contributions. It must have the same number of features of the
-            dataset used to train the model.
+            dataset used to train the model. It should be scaled in the same way
+            as the training data.
         :param compute_conditional_contribution: [bool] Whether to also compute
             all conditional contributions along the path.
         :param n_jobs: [int or None] The number of parallel processes to use if
@@ -104,11 +117,11 @@ class TreeExplainer(object):
             TE = TreeExplainer(model).explain(X_test)
 
         The following attributes are stored in self:
-        predictions: [ndarray] Contains the prediction of each feature to
+        predictions: [numpy array] Contains the prediction of each feature to
             each observation and class, averaged across trees.
-        target_frequency_at_root: [ndarray] Contains the baseline prediction of each feature
-            to each observation and class, averaged across trees.
-        contributions: [ndarray] Contains the contribution of each feature
+        target_frequency_at_root: [numpy array] Contains the baseline prediction
+            of each feature to each observation and class, averaged across trees.
+        contributions: [numpy array] Contains the contribution of each feature
             to each observation and class, averaged across trees.
         conditional_contributions: [dict] (optional if
             `compute_conditional_contribution` == True) A dictionary containing
@@ -154,7 +167,7 @@ class TreeExplainer(object):
         # Process trees in parallel
         Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
                 delayed(_compute_feature_contributions_from_tree)(
-                        estimator, i_tree, X_test, self.tree_path[i_tree],
+                        estimator, X_test, self.tree_path[i_tree],
                         compute_conditional_contribution, results, threading.Lock())
                 for i_tree, estimator in enumerate(getattr(self.model, self._internals['estimators_'])))
 
@@ -193,11 +206,16 @@ class TreeExplainer(object):
 
         return self
 
+
     ############################################################################
     # Statistics
     ############################################################################
-    def compute_min_depth_distribution(self, mean_sample='relevant_trees', sort=True):
-        """
+    def compute_min_depth_distribution(self, mean_sample='relevant_trees'):
+        """Calculates distribution of minimal depth of all variables in all trees.
+
+        REFERENCE: This function is based on plot_min_depth_distribution in the
+        R package randomForestExplainer.
+        SOURCE: https://github.com/MI2DataLab/randomForestExplainer/blob/master/R/min_depth_distribution.R
 
         :param mean_sample:
             - If mean_sample = "all_trees" (filling missing value): the minimal
@@ -216,11 +234,15 @@ class TreeExplainer(object):
             - mean_sample = "relevant_trees" (ignoring missing values): mean
             minimal depth is calculated using only non-missing values.
 
-        :return:
+        The following attributes are stored in self:
+        min_depth_frame: [pandas DataFrame] Contains the depth at which each
+            feature can be found in each tree.
+        min_depth_frame_summary: [pandas DataFrame] Contains the count of each
+            depth value for each feature.
         """
 
         # Check inputs
-        if mean_sample == 'top_trees':
+        if mean_sample != 'relevant_trees':
             raise NotImplementedError
 
         # Initialize temporary variables
@@ -280,10 +302,25 @@ class TreeExplainer(object):
     # Summary
     ################################################################################
     def summarize_importance(self, permutation_iterations=0, display=True):
+        """Calculate different measures of importance for variables presented
+        in the model. Different variables are available for classification
+        and regression models.
+
+        REFERENCE: This function is based on the function measure_importance in
+        the R package randomForestExplainer.
+        SOURCE: https://github.com/MI2DataLab/randomForestExplainer/blob/master/R/measure_importance.R
+
+        :param permutation_iterations: [int > 0] The number of permutations to
+            compute the 'significance' of the importance value of each feature.
+            If 0, the permutation test is skipped.
+        :param display: [bool] Whether to display the results in the console.
+
+        :return importance_frame: [pandas DataFrame] Contains importance metrics
+            for the model.
+        """
 
         # Initialize temporary variables
         node_purity = None
-        accuracy = None
 
         # Compute the minimal depth distribution, if not done already
         if self.min_depth_frame is None:
@@ -350,104 +387,76 @@ class TreeExplainer(object):
                 print(importance_frame)
 
 
-    def summarize_contribution_per_target(self, avg_estimator='median',
-                                          error_estimator='q',
-                                          verbose=True):
-        # Compute average and spread of contributions per target
-        # across observations
-        if avg_estimator == 'mean':
-            avg_contribution = np.mean(self.contributions, axis=0)
-        elif avg_estimator == 'median':
-            avg_contribution = np.median(self.contributions, axis=0)
-        else:
-            raise NotImplementedError(
-                'avg_estimator \'%s\' not implemented.' % avg_estimator)
-
-        if error_estimator == 'sem':
-            err_contribution = np.tile(sem(self.contributions, axis=0),
-                                       (2, 1, 1))
-        elif error_estimator == 'sd':
-            err_contribution = np.tile(np.std(self.contributions, axis=0),
-                                       (2, 1, 1))
-        elif error_estimator == 'q':
-            err_contribution = np.quantile(self.contributions, q=[.25, .75],
-                                           axis=0)
-        else:
-            raise NotImplementedError(
-                'error_estimator \'%s\' not implemented.' % error_estimator)
-
-        print()
-
-    def summarize_value_threshold(self, sort=True, silent=False):
-        # Convert data to a long format
-        feature = np.vstack([np.tile(key, (len(value), 1)) for key, value in
-                             self.value_threshold.items()])
-        value = np.hstack([np.array(value) for value in
-                           self.value_threshold.values()])
-        df = pd.DataFrame(columns=['feature', 'value'])
-        df['feature'] = feature.ravel()
-        df['value'] = value
-
-        # Compute summary
-        summary = df.groupby('feature')['value'].median()
-        # Sort features in ascending order
-        if sort:
-            order = summary.sort_values(ascending=True).index.tolist()
-        else:
-            order = df.index.tolist()
-
-        if silent:
-            return summary.loc[order]
-        else:
-            print(summary.loc[order])
-
-
     ############################################################################
     # Plots
     ############################################################################
-    def plot_min_depth_distribution(self, min_no_of_trees=None, k=None, mean_scale=False,
-                                    mean_round=2, title='Distribution of minimal depth'):
-        """Inspired by the function plot_min_depth_distribution in the R package
-        randomForestExplainer.
+    def plot_min_depth_distribution(self, top_n_features=None,
+                                    min_trees_fraction=0.0, mark_average=True,
+                                    average_n_digits=2, sort_by_weighted_mean=True,
+                                    title='Distribution of minimal depth',
+                                    colormap='tab20'):
+        """Plots distribution of minimal depth of variables in all trees along
+        with mean depths for each variable. In general, the shallower (less deep)
+        variables are the more influential.
 
-        :param k: [int] The maximal number of variables with lowest mean minimal
-            depth to plot.
-        :param min_no_of_trees: [int] The minimal number of trees in which a
-            variable has to be used for splitting to be used for plotting.
-        :param mean_scale: [bool] Should the values of mean minimal depth be
-            rescaled to the interval [0, 1]?
-        :param mean_round: [int] Number of digits for displaying mean minimal depth.
+        REFERENCE: This function has been inspired by plot_min_depth_distribution
+        in the R package randomForestExplainer.
+        SOURCE: https://github.com/MI2DataLab/randomForestExplainer/blob/master/R/min_depth_distribution.R
+
+        :param top_n_features: [int or None] The maximal number of variables with
+            lowest mean minimal depth to plot. If None, all features are shown.
+        :param min_trees_fraction: [float in range [0, 1], extrema included] The
+            fraction of trees in which a feature has to be used for splitting
+            to have the feature included in the plot.
+        :param mark_average: [bool] Whether to mark the average depth on the plot.
+        :param average_n_digits: [int] Number of digits for displaying mean
+            minimal depth.
+        :param sort_by_weighted_mean: [bool] Whether to sort features by their
+            proportion in each depth bin. In thi way, features that appeared more
+            often at a shorted depth will rank higher, despite their actual mean.
         :param title: [str] The plot title.
-        :return fig: [matplotlib Figure]
-        """
-        # Inspired by the function plot_min_depth_distribution in the R package
-        # randomForestExplainer.
-        cmap = plt.get_cmap('tab20', n_depths)
-        # Get location and width of each bar
-        feature_y_width = 1 / n_features * .9
-        feature_y_pos = np.linspace(0, 1, n_features)
-        feature_y_gap = feature_y_pos[1] - feature_y_width
+        :param colormap: [str] Name of matplotlib colormap. Default is 'tab20'.
 
-        # Compute average minimum depth and its position
+        :return fig: [matplotlib Figure] The displayed figure.
+        """
+
+        # Compute the minimal depth distribution, if not done already
+        if self.min_depth_frame is None:
+            self.compute_min_depth_distribution()
+
+        # Get number of trees in which a feature was used for splitting
+        tree_count = self.min_depth_frame_summary.groupby('feature')['count'].sum().to_frame()
+        tree_count['fraction'] = tree_count['count'] / self.n_trees
+        tree_count = tree_count[tree_count['fraction'] >= float(min_trees_fraction)]
+        # Get list of features to analyze
+        features = tree_count.index.to_list()
+
+        # Get the max depth among all trees
+        max_depth = max([value.max() for key, value in self.feature_depth.items()
+                         if key in features])
+        # Make colormap
+        cmap = plt.get_cmap(colormap, max_depth)
+
+        # Compute average minimum depth and the position of each label
         avg_min_depth = pd.DataFrame(columns=['feature', 'avg_depth', 'x', 'weight'])
         for i_feature, feature in enumerate(features):
-            data = summary.loc[summary['feature'] == feature, ['minimal_depth', 'count']]
+            data = self.min_depth_frame_summary.loc[self.min_depth_frame_summary['feature'] == feature,
+                                                    ['minimal_depth', 'count']]
             # If user did not request it, do not calculate the average
-            if mark_average is None:
-                avg_depth = np.nan
-                mean_depth_pos = np.nan
-            else:
-                this_feature_depth_values = min_depth_frame[min_depth_frame['feature'] == feature]['minimal_depth']
-                if mark_average == 'mean':
-                    avg_depth = this_feature_depth_values.mean()
-                elif mark_average == 'median':
-                    avg_depth = this_feature_depth_values.median()
+            if mark_average:
+                this_feature_depth_values = self.min_depth_frame[
+                    self.min_depth_frame['feature'] == feature]['minimal_depth']
+                avg_depth = this_feature_depth_values.mean()
                 sorted_depth_values = np.hstack([np.linspace(data.iloc[i]['minimal_depth'],
                                                              data.iloc[i]['minimal_depth'] + 1,
                                                              data.iloc[i]['count'])
                                                  for i in range(data.shape[0])])
                 mean_depth_pos = np.abs(sorted_depth_values - avg_depth).argmin()
                 mean_depth_pos = np.clip(mean_depth_pos, a_min=0, a_max=self.n_trees).astype(int)
+            else:
+                avg_depth = np.nan
+                mean_depth_pos = np.nan
+
             # Store values
             avg_min_depth.at[i_feature, 'feature'] = feature
             avg_min_depth.at[i_feature, 'avg_depth'] = avg_depth
@@ -455,25 +464,26 @@ class TreeExplainer(object):
             avg_min_depth.at[i_feature, 'weight'] = (data['count'] * data['minimal_depth'] ** 2).sum()
 
         # Sort values
-        if mark_average is not None and sort_by_average:
-            sort_by = 'avg_depth'
-        else:
+        if sort_by_weighted_mean:
             # Features used closer to the root more often will rank higher
             sort_by = 'weight'
+        else:
+            sort_by = 'avg_depth'
         # Apply sorting
         avg_min_depth.sort_values(sort_by, ascending=True, inplace=True)
         avg_min_depth.reset_index(drop=True, inplace=True)
-        # Re-extract list of feature
+        # Re-extract (sorted) list of features
         features = avg_min_depth['feature'].tolist()
-
-
-        # Get list and number of features
-        features = natural_sort(np.unique(summary['feature']).tolist())
-        n_features = len(features)
+        # Keep only top features
+        if top_n_features is not None:
+            features = features[:top_n_features]
         # Generate a color for each depth level
-        depth_values = np.arange(summary['minimal_depth'].max() + 1)
-        n_depths = depth_values.shape[0]
-
+        depth_values = np.arange(max_depth + 1)
+        # Get location and width of each bar
+        n_features = len(features)
+        feature_y_width = 1 / n_features * .9
+        feature_y_pos = np.linspace(0, 1, n_features)
+        feature_y_gap = feature_y_pos[1] - feature_y_width
 
         # Open figure
         fig = plt.figure(figsize=(7, 8))
@@ -482,15 +492,16 @@ class TreeExplainer(object):
         # Plot horizontally stacked bars
         for i_feature, feature in enumerate(features):
             # Get data and prepare x- and y-ranges
-            data = summary.loc[summary['feature'] == feature, ['depth', 'count']]
+            data = self.min_depth_frame_summary.loc[self.min_depth_frame_summary['feature'] == feature,
+                                                    ['minimal_depth', 'count']]
             # Add missing depths
-            missing_depths = np.setdiff1d(depth_values, data['depth'])
+            missing_depths = np.setdiff1d(depth_values, data['minimal_depth'])
             data = pd.concat((data, pd.DataFrame(np.vstack((missing_depths, np.zeros(missing_depths.shape[0]))).T.astype(int),
                                                  columns=data.columns)), ignore_index=True,
                              sort=True)
-            data.sort_values(by='depth', ascending=True, inplace=True)
+            data.sort_values(by='minimal_depth', ascending=True, inplace=True)
             # Get count
-            count = data.sort_values(by='depth')['count'].values
+            count = data.sort_values(by='minimal_depth')['count'].values
             count = np.vstack((np.cumsum(count) - count, count)).T.tolist()
             # Plot horizontal bars
             yrange = (feature_y_pos[i_feature], feature_y_width)
@@ -503,7 +514,7 @@ class TreeExplainer(object):
                         color='k', lw=5, solid_capstyle='butt')
                 # Add text box showing the value of the mean
                 ax.text(avg_min_depth.loc[i_feature, 'x'], yrange[0] + yrange[1] / 2,
-                        '%%.%if' % mean_round % avg_min_depth.loc[i_feature, 'avg_depth'],
+                        '%%.%if' % average_n_digits % avg_min_depth.loc[i_feature, 'avg_depth'],
                         ha='center', va='center', bbox=dict(boxstyle='round', facecolor='w'))
 
         # Adjust axes appearance
@@ -514,6 +525,8 @@ class TreeExplainer(object):
         ax.spines['left'].set_color('None')
         ax.tick_params(axis='y', length=0, pad=0)
         ax.set_xlabel('Number of trees')
+        if top_n_features is not None:
+            title += ' (top %i features)' % top_n_features
         ax.set_title(title)
         # Adjust layout
         fig.tight_layout()
@@ -522,10 +535,7 @@ class TreeExplainer(object):
         ax.axvline(self.n_trees, color='k', lw=.5)
 
         # Add colorbar
-        cmap_cbar = mpl.colors.LinearSegmentedColormap.from_list('colormap for '
-                                                                 'colorbar',
-                                                                 cmap.colors,
-                                                                 cmap.N)
+        cmap_cbar = LinearSegmentedColormap.from_list('cmap', cmap.colors, cmap.N)
         ax_bg = fig.add_axes(ax.get_position())
         im_cbar = ax_bg.imshow(np.tile(depth_values, (2, 1)),
                                cmap=cmap_cbar, aspect='auto', interpolation=None,
@@ -550,6 +560,7 @@ class TreeExplainer(object):
 
 
     def plot_value_threshold(self, sort=True):
+        raise NotImplementedError
         # Get summary data
         df = self.summarize_value_threshold(sort=sort, silent=True)
 
@@ -576,17 +587,4 @@ class TreeExplainer(object):
 
         # Show figure
         fig.show()
-
-
-################################################################################
-# Utilities
-################################################################################
-def log(message):
-    """Print message to console or terminal.
-    :param message: [str] The message to print.
-    """
-
-    sys.stdout.write(message + '\n')
-    sys.stdout.flush()
-
 

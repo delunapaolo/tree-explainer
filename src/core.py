@@ -2,17 +2,20 @@
 import re
 # Numerical
 import numpy as np
-# Local repo
+# Local repository
 from utilities.numerical import divide0
 
 
 def _compute_tree_paths(estimator, i_tree, results, lock):
-    """
+    """Get information about a tree model, such as the depth of the tree, the
+    depth at which each feature is found, the number of nodes in the tree, and
+    the threshold values used for splitting at each node.
 
-    :param estimator:
-    :param i_tree:
-    :param results:
-    :param lock:
+    :param estimator: [object] The tree model.
+    :param i_tree: [int] The index of the tree currently analyzed.
+    :param results: [dict] The output variable, which is shared with the other
+        cores.
+    :param lock: [object] A threading.Lock() instance.
 
     :return results: [dict] Contains:
     - feature_depth: [dict] Each key (corresponding to a feature) contains
@@ -26,8 +29,8 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
     - value_threshold: [dict] Each key (corresponding to a feature) contains
         the threshold for splitting on a feature. Unused features are not
         listed.
-
     """
+
     paths = get_tree_paths(estimator.tree_, node_id=0, depth=0)
     # Reverse direction of path, and convert to tuple
     paths = tuple([np.array(path)[::-1] for path in paths])
@@ -47,7 +50,8 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
     for i_feature, feature in enumerate(features):
         feature_position = np.where(node_features == feature)[0]
         # Look for the position of this feature in each path
-        this_feature_depth = [np.where(np.in1d(path, feature_position))[0] for path in paths]
+        this_feature_depth = [np.where(np.in1d(path, feature_position))[0]
+                              for path in paths]
         # Get unique list of nodes at which the feature can be found
         this_feature_depth = np.unique(np.hstack(this_feature_depth))
         # Get threshold values
@@ -68,26 +72,69 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
             results['no_of_nodes'][feature_name][i_tree] = no_of_nodes[i_feature]
 
 
-def _compute_feature_contributions_from_tree(estimator, i_tree, X_test, paths,
+def get_tree_paths(tree, node_id, depth=0):
+    """Recursively navigate a tree model to gather the node_ids of each decision
+    path.
+
+    REFERENCE: This function is based on _get_tree_paths in the python package
+    treeinterpreter.
+    SOURCE: https://github.com/andosa/treeinterpreter/blob/master/treeinterpreter/treeinterpreter.py
+    """
+
+    # The following variables mark leaves and undefined nodes. They can be
+    # obtained with: from sklearn.tree._tree import TREE_LEAF, TREE_UNDEFINED
+    TREE_LEAF = -1
+    # For the records, TREE_UNDEFINED = -2
+
+    if node_id == TREE_LEAF:
+        raise ValueError("Invalid node_id %s" % node_id)
+
+    # Get the id of the left branch
+    left_branch = tree.children_left[node_id]
+    if left_branch != TREE_LEAF:  # we haven't reached a leaf yet
+        # Follow path a level deeper on the left and the right branches
+        left_paths = get_tree_paths(tree, left_branch, depth=depth + 1)
+        right_branch = tree.children_right[node_id]
+        right_paths = get_tree_paths(tree, right_branch, depth=depth + 1)
+        # Append the if of the current node to all paths leading here
+        for path in left_paths:
+            path.append(node_id)
+        for path in right_paths:
+            path.append(node_id)
+        # Append the two lists
+        paths = left_paths + right_paths
+
+    else:  # This path has led to a leaf
+        paths = [[node_id]]
+
+    return paths
+
+
+def _compute_feature_contributions_from_tree(estimator, X_test, paths,
                                              compute_conditional_contribution,
                                              results, lock):
     """For a given tree estimator computes target frequency at the tree root
     and feature contributions, such that prediction ≈ target_frequency_at_root +
     feature_contributions.
 
-    :param estimator: The tree from which to calculate feature contributions.
-    :param X_test: [ndarray] Data on which to test feature contributions. It
+    REFERENCE: This function is based on _predict_tree in the python package
+    treeinterpreter.
+    SOURCE: https://github.com/andosa/treeinterpreter/blob/master/treeinterpreter/treeinterpreter.py
+
+    :param estimator: [object] The tree from which to calculate feature
+        contributions.
+    :param X_test: [numpy array] Data on which to test feature contributions. It
         must have the same number of features of the dataset used to train
         the model.
     :param compute_conditional_contribution: [bool] Whether to also return all
         the conditional contributions along the path.
 
     :return results: [dict] Contains:
-    - predictions: [ndarray] Prediction of each feature to each observation
+    - predictions: [numpy array] Prediction of each feature to each observation
         and target.
-    - target_frequency_at_root: [ndarray] Baseline prediction of each feature
+    - target_frequency_at_root: [numpy array] Baseline prediction of each feature
         to each observation and target.
-    - contributions: [ndarray] Contribution of each feature to each observation
+    - contributions: [numpy array] Contribution of each feature to each observation
         and target.
     - conditional_contributions: [dict] (optional if
         `compute_conditional_contribution` == True) A dictionary containing
@@ -197,40 +244,6 @@ def _compute_feature_contributions_from_tree(estimator, i_tree, X_test, paths,
                 else:
                     results['conditional_contributions'] = conditional_contributions[features]
 
-
-def get_tree_paths(tree, node_id, depth=0):
-    """Recursively navigate a tree model to gather the node_ids of each decision
-    path. This function was originally implemented by as get_tree_paths() on
-    the Github repo andosa/utilities in the module utilities.py.
-    """
-
-    # The following variables mark leaves and undefined nodes. They can be obtained with:
-    # from sklearn.tree._tree import TREE_LEAF, TREE_UNDEFINED
-    TREE_LEAF = -1
-    # For the records, TREE_UNDEFINED = -2
-
-    if node_id == TREE_LEAF:
-        raise ValueError("Invalid node_id %s" % node_id)
-
-    # Get the id of the left branch
-    left_branch = tree.children_left[node_id]
-    if left_branch != TREE_LEAF:  # we haven't reached a leaf yet
-        # Follow path a level deeper on the left and the right branches
-        left_paths = get_tree_paths(tree, left_branch, depth=depth + 1)
-        right_branch = tree.children_right[node_id]
-        right_paths = get_tree_paths(tree, right_branch, depth=depth + 1)
-        # Append the if of the current node to all paths leading here
-        for path in left_paths:
-            path.append(node_id)
-        for path in right_paths:
-            path.append(node_id)
-        # Append the two lists
-        paths = left_paths + right_paths
-
-    else:  # This path has led to a leaf
-        paths = [[node_id]]
-
-    return paths
 
 
 def validate_model_type(model):
