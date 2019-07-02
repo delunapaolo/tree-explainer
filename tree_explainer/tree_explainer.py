@@ -14,10 +14,10 @@ from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 
 # Local repo
-from .core import validate_model_type, validate_model_is_trained
-from .core import _compute_tree_paths, _compute_feature_contributions_from_tree
-from .utilities.numerical import divide0
-from .utilities.visualization import adjust_spines
+from core import validate_model_type, validate_model_is_trained
+from core import _compute_tree_paths, _compute_feature_contributions_from_tree
+from utilities.numerical import divide0
+from utilities.visualization import adjust_spines
 
 
 ################################################################################
