@@ -1,4 +1,4 @@
-# System
+# Standard
 import threading
 from joblib import Parallel, delayed
 from warnings import warn
@@ -14,10 +14,13 @@ from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 
 # Local repo
-from core import validate_model_type, validate_model_is_trained
-from core import _compute_tree_paths, _compute_feature_contributions_from_tree
-from utilities.numerical import divide0
-from utilities.visualization import adjust_spines
+from tree_explainer.core import validate_model_type, validate_model_is_trained
+from tree_explainer.core import _compute_tree_paths
+from tree_explainer.core import _compute_feature_contributions_from_tree
+from tree_explainer.core import _compute_two_way_conditional_contributions
+from tree_explainer.utilities.numerical import divide0
+from tree_explainer.utilities.visualization import adjust_spines
+from tree_explainer.utilities.lists import true_list
 
 
 ################################################################################
@@ -44,6 +47,8 @@ class TreeExplainer(object):
         # Check that model has been fit
         n_estimators_attr, estimators_attr = validate_model_is_trained(model, model_class)
 
+        if verbose:
+            print('Detecting trees structure and features ...')
         # Store model and info on it
         self.model = model
         # Keep a reference to these attributes of the model
@@ -58,40 +63,56 @@ class TreeExplainer(object):
         self.n_features = self.model.n_features_
         if feature_names is None:
             feature_names = ['feature_%i' % (i + 1) for i in range(self.n_features)]
-        self.feature_names = feature_names
+        self.feature_names = true_list(feature_names)
         if target_names is None:
             if self._internals['model_type'] == 'classifier':
                 target_names = ['target_%i' % (i + 1) for i in range(self.model.n_classes_)]
-        self.target_names = target_names
+        self.target_names = true_list(target_names)
         self.n_targets = len(self.target_names)
 
         # Extract decision path of each tree in model
-        results = dict()
+        results = dict(feature_names=self.feature_names)
         results['tree_path'] = list(np.empty((self.n_trees, ), dtype=object))
-        results['tree_depth'] = np.zeros((self.n_trees, ), dtype=np.int8)
-        results['feature_depth'] = {f: np.zeros((self.n_trees, ), dtype=np.int8) - 1 for f in self.feature_names}
+        results['features_split'] = list(np.empty((self.n_trees, ), dtype=object))
+        results['tree_feature_path'] = list(np.empty((self.n_trees,), dtype=object))
+        results['tree_depth'] = np.zeros((self.n_trees, ), dtype=int)
+        results['feature_depth'] = {f: np.zeros((self.n_trees, ), dtype=int) - 1 for f in self.feature_names}
         results['value_threshold'] = {f: np.zeros((self.n_trees, ), dtype=np.float32) * np.nan for f in self.feature_names}
-        results['no_of_nodes'] = {f: np.zeros((self.n_trees,), dtype=np.int8) - 1 for f in self.feature_names}
+        results['no_of_nodes'] = {f: np.zeros((self.n_trees,), dtype=int) - 1 for f in self.feature_names}
         Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
                 delayed(_compute_tree_paths)(estimator, i_tree, results, threading.Lock())
                 for i_tree, estimator in enumerate(getattr(self.model, self._internals['estimators_'])))
         # Store results
         self.tree_path = results['tree_path']
+        self.features_split = results['features_split']
+        self.tree_feature_path = results['tree_feature_path']
         self.tree_depth = results['tree_depth']
         self.feature_depth = results['feature_depth']
         self.value_threshold = results['value_threshold']
         self.no_of_nodes = results['no_of_nodes']
-        # Initialize all other TreeExplainer's attributes
+        # Initialize all other TreeExplainer's attributes. Initialized explicitly
+        # to silence warnings of interpreters.
+        self.X = None
+        self.y = None
+        self.n_samples = None
+        self._data_type = None
         self.predictions = None
         self.prediction_probabilities = None
         self.contributions = None
         self.conditional_contributions = None
+        self.feature_combinations = None
+        self.conditional_contributions_sample = None
         self.min_depth_frame = None
         self.min_depth_frame_summary = None
         self.importance_frame = None
+        self.two_way_contribution_table = None
+        self.n_two_way_contribution_table = None
+
+        if verbose:
+            print('done')
 
 
-    def explain(self, X_test, compute_conditional_contribution=False,
+    def explain(self, X_test, y_test, compute_conditional_contributions=False,
                 n_jobs=-1, verbose=False):
         """Main method to explain the provided predictions of the model. It
         computes feature contributions, such that:
@@ -101,11 +122,14 @@ class TreeExplainer(object):
         package treeinterpreter.
         SOURCE: https://github.com/andosa/treeinterpreter/blob/master/treeinterpreter/treeinterpreter.py
 
-        :param X_test: [numpy or DataFrame] Data on which to test feature
-            contributions. It must have the same number of features of the
-            dataset used to train the model. It should be scaled in the same way
-            as the training data.
-        :param compute_conditional_contribution: [bool] Whether to also compute
+        :param X_test: [numpy array or pandas DataFrame] Data on which to test
+            feature contributions. It must have the same number of features of
+            the dataset used to train the model. It should be scaled in the same
+            way as the training data.
+        :param y_test: [numpy array] True target values of each instance in X_test.
+            For classification tasks, it contains the class labels, for
+            regression problems the true value.
+        :param compute_conditional_contributions: [bool] Whether to also compute
             all conditional contributions along the path.
         :param n_jobs: [int or None] The number of parallel processes to use if
             joblib is installed. If None, trees are processed sequentially.
@@ -133,13 +157,24 @@ class TreeExplainer(object):
         """
 
         # Initialize TreeExplainer's attributes that depend on the supplied data
+        self.X = None
+        self.y = None
+        self.n_samples = None
+        self._data_type = None
         self.predictions = None
         self.prediction_probabilities = None
         self.contributions = None
         self.conditional_contributions = None
+        self.feature_combinations = None
+        self.conditional_contributions_sample = None
         self.min_depth_frame = None
         self.min_depth_frame_summary = None
         self.importance_frame = None
+        self.two_way_contribution_table = None
+        self.n_two_way_contribution_table = None
+
+        if verbose:
+            print('Computing feature contributions ...')
 
         # Set feature names
         if isinstance(X_test, pd.DataFrame):
@@ -152,33 +187,37 @@ class TreeExplainer(object):
             did_change_feature_names = False
 
         # Initialize output variable
-        n_samples = X_test.shape[0]
-        data_type = X_test.dtype
+        self.X = X_test.astype(np.float32)
+        self.y = y_test
+        self.n_samples = self.X.shape[0]
+        self._data_type = self.X.dtype
         # Compute and store predictions
-        self.predictions = self.model.predict(X_test)
-        self.prediction_probabilities = self.model.predict_proba(X_test)
+        self.prediction_probabilities = self.model.predict_proba(self.X)
+        if self._internals['model_type'] == 'classifier':
+            self.predictions = np.argmax(self.prediction_probabilities, axis=1)
+        else:
+            raise NotImplementedError
 
         # Compute contributions
         results = dict()
-        results['contributions'] = np.zeros((n_samples, self.n_features, self.n_targets), dtype=data_type)
-        results['contributions_n_evaluations'] = np.zeros((n_samples, self.n_features, self.n_targets), dtype=data_type)
-        results['conditional_contributions'] = dict()
-        # results['conditional_contributions_samples'] = dict()
+        results['tree_path'] = list(np.empty((self.n_trees,), dtype=object))
+        results['contributions'] = np.zeros((self.n_samples, self.n_features, self.n_targets), dtype=self._data_type)
+        results['contributions_n_evaluations'] = np.zeros((self.n_samples, self.n_features, self.n_targets), dtype=self._data_type)
+        if compute_conditional_contributions:
+            no_of_nodes_per_tree = [i.shape[0] for i in self.features_split]
+            results['conditional_contributions'] = list([np.zeros((i, self.n_targets)) for i in no_of_nodes_per_tree])
+            results['conditional_contributions_sample'] = list(np.empty((self.n_trees, ), dtype=object))
+        else:
+            results['conditional_contributions'] = None
+            results['conditional_contributions_sample'] = None
+        # Copy 'features_split'
+        results['features_split'] = self.features_split
         # Process trees in parallel
         Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
                 delayed(_compute_feature_contributions_from_tree)(
-                        estimator, X_test, self.tree_path[i_tree],
-                        compute_conditional_contribution, results, threading.Lock())
+                        estimator, i_tree, self.X, self.y, self.tree_path[i_tree],
+                        compute_conditional_contributions, results, threading.Lock())
                 for i_tree, estimator in enumerate(getattr(self.model, self._internals['estimators_'])))
-
-        if compute_conditional_contribution:
-            # Average across the same set of features used by multiple trees
-            feature_sets = list(results['conditional_contributions'].keys())
-            for features in feature_sets:
-                if results['conditional_contributions'][features].ndim == 3:
-                    results['conditional_contributions'][features] = \
-                        np.mean(results['conditional_contributions'][features],
-                                axis=2)
 
         if np.any(results['contributions_n_evaluations'] == 0):
             n_not_evaluated_features = np.unique(np.where(results['contributions_n_evaluations'] == 0)[1]).shape[0]
@@ -189,20 +228,24 @@ class TreeExplainer(object):
         # Features that were never evaluated will return NaN
         self.contributions = divide0(results['contributions'], results['contributions_n_evaluations'],
                                      replace_with=np.nan)
-        # We always save this variable to avoid that another call to this method would mix values referring to different X_test
+        # Store conditional contributions
         self.conditional_contributions = results['conditional_contributions']
+        self.conditional_contributions_sample = results['conditional_contributions_sample']
 
         # Rename features
         if did_change_feature_names:
             raise NotImplementedError
-            self.feature_depth = {self.feature_names[key]: value for key, value in
-                                  self.feature_depth.items()}
-            self.tree_depth = np.array(tree_depth)
-            self.value_threshold = {self.feature_names[key]: value for key, value in
-                                  self.value_threshold.items()}
-            if compute_conditional_contribution:
-                self.conditional_contributions = {self.feature_names[key]: value for key, value in
-                                                  self.conditional_contributions.items()}
+            # self.feature_depth = {self.feature_names[key]: value for key, value in
+            #                       self.feature_depth.items()}
+            # self.tree_depth = np.array(tree_depth)
+            # self.value_threshold = {self.feature_names[key]: value for key, value in
+            #                       self.value_threshold.items()}
+            # if compute_conditional_contributions:
+            #     self.conditional_contributions = {self.feature_names[key]: value for key, value in
+            #                                       self.conditional_contributions.items()}
+
+        if verbose:
+            print('done')
 
         return self
 
@@ -298,6 +341,105 @@ class TreeExplainer(object):
         self.min_depth_frame_summary = summary
 
 
+    def compute_two_way_interactions(self, n_jobs=-1,
+                                     verbose=False):
+        """This function computes tables of two-way conditional interactions
+        between features. These values are the relative change in feature
+        contribution at a node where a feature is in the parent node, and another
+        one in one of the children. This type of information could highlight
+        whether there are combinations of features that are used in sequence
+        more often than others. The last column of the table reports the
+        relative contribution of a feature when used at the root of the tree.
+
+        Values are averaged across trees and observations in the data provided
+        to the explain() method.
+
+        If the model is a classifier, we can further  divide feature
+        contributions between correct and incorrect predictions of the model,
+        to characterize how features interact when the model turns out to be
+        right and when it is wrong.
+
+        :param n_jobs: [int or None] The number of parallel process to use.
+        :param verbose: [bool] Whether to print progress messages.
+
+        The following attributes are stored in self:
+        two_way_contribution_table: [dict] Contains pandas DataFrames of
+            relative feature contributions when 'all' samples are used. If the
+            model is a classifier, also tables for 'correct' and 'incorrect'
+            predictions will be calculated. In each table, larger values indicate
+            that when a particular feature is used after another one, there is a
+            more pronounced change in the prediction.
+        n_two_way_contribution_table: [dict] Same as two_way_contribution_table.
+            However, it contains the number of times a feature was used for split.
+            Higher values stand for a more frequent use of a combination of
+            features, indicating a possible relationship between them.
+        """
+        # Cannot continue if conditional contributions are not present
+        if self.conditional_contributions is None:
+            raise AttributeError('Conditional contributions need to be calculated before summarizing them.')
+
+        # Initialize temporary variables
+        key_name = None
+        samples = None
+
+        # If the model is a classifier, separate contributions for correct and
+        # incorrect predictions of the model
+        if self._internals['model_type'] == 'classifier':
+            n_iterations = 3
+        else:
+            n_iterations = 1
+
+        # Initialize output variables
+        self.two_way_contribution_table = dict()
+        self.n_two_way_contribution_table = dict()
+        for i_iter in range(n_iterations):
+            if i_iter == 0:  # Select all samples
+                samples = np.arange(self.n_samples)
+                key_name = 'all'
+
+            else:
+                if self._internals['model_type'] == 'classifier':
+                    if i_iter == 1:  # Select only correctly predictions samples
+                        samples = np.where(self.y == self.predictions)[0]
+                        key_name = 'correct'
+                    elif i_iter == 2:  # Select only wrongly predicted samples
+                        samples = np.where(self.y != self.predictions)[0]
+                        key_name = 'incorrect'
+
+            if verbose:
+                print('Computing two-way feature interactions of %s predictions ...' % key_name)
+
+            # Initialize heatmap-tables
+            results = dict()
+            results['contribution_values'] = np.zeros((self.n_features,
+                                                       self.n_features + 1,
+                                                       self.n_targets),
+                                                      dtype=self._data_type)
+            results['contribution_values_n'] = np.zeros((self.n_features,
+                                                         self.n_features + 1),
+                                                        dtype=int)
+
+            # Process trees in parallel
+            Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
+                    delayed(_compute_two_way_conditional_contributions)(samples,
+                                               self.conditional_contributions[i_tree],
+                                               self.conditional_contributions_sample[i_tree],
+                                               self.features_split[i_tree],
+                                               results, threading.Lock())
+                    for i_tree, estimator in enumerate(getattr(self.model, self._internals['estimators_'])))
+
+            # Store values
+            # Average interactions across all samples and trees. Combinations of
+            # features that have never been selected will get a NaN
+            self.two_way_contribution_table[key_name] = divide0(results['contribution_values'],
+                                                                np.atleast_3d(results['contribution_values_n']),
+                                                                replace_with=np.nan)
+            self.n_two_way_contribution_table[key_name] = results['contribution_values_n']
+
+        if verbose:
+            print('done')
+
+
     ################################################################################
     # Summary
     ################################################################################
@@ -387,14 +529,18 @@ class TreeExplainer(object):
                 print(importance_frame)
 
 
+    def summarize_conditional_contributions(self):
+        print()
+
+
     ############################################################################
     # Plots
     ############################################################################
     def plot_min_depth_distribution(self, top_n_features=None,
                                     min_trees_fraction=0.0, mark_average=True,
-                                    average_n_digits=2, sort_by_weighted_mean=True,
+                                    average_n_digits=2, sort_by_weighted_mean=False,
                                     title='Distribution of minimal depth',
-                                    colormap='tab20'):
+                                    colormap='tab20', return_figure_handle=False):
         """Plots distribution of minimal depth of variables in all trees along
         with mean depths for each variable. In general, the shallower (less deep)
         variables are the more influential.
@@ -416,6 +562,8 @@ class TreeExplainer(object):
             often at a shorted depth will rank higher, despite their actual mean.
         :param title: [str] The plot title.
         :param colormap: [str] Name of matplotlib colormap. Default is 'tab20'.
+        :param return_figure_handle: [bool] Whether to return the figure handle,
+            which can be used for printing, for example.
 
         :return fig: [matplotlib Figure] The displayed figure.
         """
@@ -489,6 +637,8 @@ class TreeExplainer(object):
         fig = plt.figure(figsize=(7, 8))
         fig.clf()
         ax = fig.add_subplot(1, 1, 1)
+        # Mark the maximum number of trees used
+        max_n_trees = 0
         # Plot horizontally stacked bars
         for i_feature, feature in enumerate(features):
             # Get data and prepare x- and y-ranges
@@ -502,10 +652,11 @@ class TreeExplainer(object):
             data.sort_values(by='minimal_depth', ascending=True, inplace=True)
             # Get count
             count = data.sort_values(by='minimal_depth')['count'].values
-            count = np.vstack((np.cumsum(count) - count, count)).T.tolist()
+            count = np.vstack((np.cumsum(count) - count, count)).T
+            max_n_trees = max(max_n_trees, count.max())
             # Plot horizontal bars
             yrange = (feature_y_pos[i_feature], feature_y_width)
-            ax.broken_barh(xranges=count, yrange=yrange, facecolors=cmap.colors,
+            ax.broken_barh(xranges=count.tolist(), yrange=yrange, facecolors=cmap.colors,
                            alpha=.8)
             # Mark average depth
             if mark_average is not None:
@@ -521,10 +672,11 @@ class TreeExplainer(object):
         ax.set_yticks(feature_y_pos + feature_y_width / 2)
         ax.set_yticklabels(features)
         ax.set_ylim(1 + feature_y_width + feature_y_gap, 0)
+        ax.set_xlim(0, max_n_trees)
         adjust_spines(ax, spines=['bottom', 'left'], offset=0, smart_bounds=True)
         ax.spines['left'].set_color('None')
         ax.tick_params(axis='y', length=0, pad=0)
-        ax.set_xlabel('Number of trees')
+        ax.set_xlabel('Number of trees (out of %i)' % self.n_trees)
         if top_n_features is not None:
             title += ' (top %i features)' % top_n_features
         ax.set_title(title)
@@ -535,7 +687,7 @@ class TreeExplainer(object):
         ax.axvline(self.n_trees, color='k', lw=.5)
 
         # Add colorbar
-        cmap_cbar = LinearSegmentedColormap.from_list('cmap', cmap.colors, cmap.N)
+        cmap_cbar = LinearSegmentedColormap.from_list('cmap', cmap.colors, cmap.N + 1)
         ax_bg = fig.add_axes(ax.get_position())
         im_cbar = ax_bg.imshow(np.tile(depth_values, (2, 1)),
                                cmap=cmap_cbar, aspect='auto', interpolation=None,
@@ -556,35 +708,135 @@ class TreeExplainer(object):
         cbar.ax.set_position([bbox.x0 + .025, bbox.y0, bbox.x1 - bbox.x0, .6])
         cbar.ax.set_title('Minimal\ndepth')
 
-        return fig
+        if return_figure_handle:
+            return fig
 
 
-    def plot_value_threshold(self, sort=True):
-        raise NotImplementedError
-        # Get summary data
-        df = self.summarize_value_threshold(sort=sort, silent=True)
+    def plot_two_way_interactions(self, sort_features_on_target=True,
+                                  targets_to_plot=None, sort_on_contributions=True,
+                                  top_n_features=None, return_fig_handle=False):
 
-        # Open figure
-        fig = plt.figure(figsize=(7, 8))
-        fig.clf()
-        # Make violin plot in gray
-        ax = sns.violinplot(y='feature', x='value', data=df,
-                            scale='count', orient='h', inner=None, color='.8',
-                            width=.6, cut=0, bw=.2)
-        # Overlay strip-plot
-        ax = sns.stripplot(y='feature', x='value', data=df,
-                           orient='h', palette='Set2', linewidth=1,
-                           size=5, ax=ax, jitter=True)
-        # Draw 0-line
-        ax.axvline(0, color='r', lw=.5)
-        # Adjust axes appearance
-        adjust_spines(ax, ['bottom', 'left'], offset=3, smart_bounds=True)
-        ax.set_xlabel('Feature value')
-        ax.set_ylabel('')
-        ax.spines['left'].set_color('w')
-        ax.tick_params(axis='y', length=0)
-        fig.tight_layout()
+        # Compute the minimal depth distribution, if not done already
+        if self.two_way_contribution_table is None:
+            self.compute_two_way_interactions(n_jobs=-1, verbose=True)
 
-        # Show figure
-        fig.show()
+        # If sort_features_on_target is True, and which target is unspecified,
+        # use the first target that will be plotted
+        if isinstance(sort_features_on_target, bool):
+            if sort_features_on_target:
+                sort_features_on_target = targets_to_plot[0]
 
+        # Set number of subplot columns in figure
+        if targets_to_plot is not None:
+            targets_to_plot = true_list(targets_to_plot)
+
+        else:
+            if isinstance(sort_features_on_target, str):
+                targets_to_plot = list([sort_features_on_target])
+
+            elif self._internals['model_type'] == 'classifier' and self.n_targets == 2:
+                # If this is a binary classification task, the contribution to each
+                # target will be identical, so we'll plot only one
+                targets_to_plot = list([self.target_names[-1]])  # Assume that more interesting label is the highest
+
+            else:
+                targets_to_plot = list(self.target_names)
+
+        # Get indices of targets to plot
+        targets_to_plot_idx = [self.target_names.index(i) for i in targets_to_plot]
+        n_columns = len(targets_to_plot_idx)
+        # Add another plot for the heatmap with percentage of values
+        n_columns += 1
+
+        # A column for each heatmap
+        tables = list(self.two_way_contribution_table.keys())
+        n_figures = len(tables)
+
+        for i_fig in range(n_figures):
+            # If sort_features_on_target is a string, it is the name of the target
+            # to use. In that case, get a sorting order for the columns
+            if isinstance(sort_features_on_target, str):
+                # Select corresponding data
+                index_of_target = self.target_names.index(sort_features_on_target)
+                if sort_on_contributions:
+                    data = self.two_way_contribution_table[tables[i_fig]][:, :, index_of_target]
+                else:
+                    data = self.n_two_way_contribution_table[tables[i_fig]]
+                # Convert to DataFrame
+                df = pd.DataFrame(data, index=self.feature_names,
+                                  columns=self.feature_names + ['root'])
+                # Sort by contribution when feature is used at the root
+                df['root'].replace(to_replace=np.nan, value=0, inplace=True)
+                df.sort_values(by='root', ascending=False, inplace=True,
+                               na_position='last')
+                # Get order of features
+                features_order = list(df.index)
+
+            else:
+                features_order = list(self.feature_names)
+
+            # Keep only at most n features
+            if top_n_features is not None:
+                features_order = features_order[:top_n_features]
+
+            # Open figure and plot heatmaps
+            fig, ax = plt.subplots(nrows=1, ncols=n_columns, figsize=(13, 5))
+            for i_col in range(n_columns):
+                # Assess whether to add an annotation to the heatmap
+                heatmap_annotations = len(features_order) < 15
+
+                # Select data
+                if i_col < n_columns - 1:  # Contribution values go in the first n-1 plots
+                    data = self.two_way_contribution_table[tables[i_fig]][:, :, targets_to_plot_idx[i_col]]
+                    subplot_title = 'Predictions for \'%s\'' % self.target_names[targets_to_plot_idx[i_col]]
+
+                else:  # Percentages go in the last plot
+                    data = self.n_two_way_contribution_table[tables[i_fig]]
+                    # Normalize across number of trees and samples to
+                    # obtain a percentage
+                    data = data / self.n_trees / self.n_samples * 100
+                    subplot_title = 'Combination frequencies'
+
+                # Remove 0s
+                data[data == 0] = np.nan
+                # Convert data to DataFrame, so it can be passed to seaborn
+                df = pd.DataFrame(data, index=self.feature_names,
+                                  columns=self.feature_names + ['root'])
+                # Move root to the front
+                df = pd.concat((df['root'], df[self.feature_names]), axis=1)
+
+                # Sort features
+                if features_order is not None:
+                    # Select and sort columns
+                    df = pd.concat((df['root'], df[features_order]), axis=1)
+                    # Select and sort rows
+                    df = df.loc[features_order]
+
+                # Determine whether annotation should be displayed
+                data = df.values.ravel()
+                if np.all(np.abs(data[np.isfinite(data)]) < 1):
+                    heatmap_annotations = False
+
+                # Add column for sum contribution across all combinations
+                # if i_col < n_columns - 1:  # Plot contribution values
+                #     marginal_contribution = self.contributions[:, :, targets_to_plot[i_col]].mean(axis= 0)
+                #     # Sort features, if necessary
+                #     if features_order is not None:
+                #         marginal_contribution = [marginal_contribution[features_order.index(i)] for i in self.feature_names]
+                #     # Store values
+                #     df['marginal'] = marginal_contribution
+
+                # Plot heatmap
+                ax[i_col] = sns.heatmap(df, cmap='RdBu_r', center=0,
+                                        square=True, ax=ax[i_col], annot=heatmap_annotations,
+                                        fmt='.0f')
+                # Fix axes appearance
+                ax[i_col].set_title(subplot_title)
+
+            # Add title to figure
+            fig.suptitle('%s%s predictions' % (tables[i_fig][0].upper(), tables[i_fig][1:]))
+            plt.tight_layout()
+            fig.subplots_adjust(top=.9, bottom=fig.subplotpars.bottom + .01)
+
+        if return_fig_handle:
+            return fig
