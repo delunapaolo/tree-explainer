@@ -1,9 +1,14 @@
 # String manipulation
 import re
+import warnings
+warnings.simplefilter('ignore', FutureWarning)
+
 # Numerical
 import numpy as np
+import pandas as pd
+
 # Local repository
-from utilities.numerical import divide0
+from tree_explainer.utilities.numerical import divide0
 
 
 def _compute_tree_paths(estimator, i_tree, results, lock):
@@ -33,7 +38,7 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
 
     paths = get_tree_paths(estimator.tree_, node_id=0, depth=0)
     # Reverse direction of path, and convert to tuple
-    paths = tuple([np.array(path)[::-1] for path in paths])
+    paths = tuple([np.array(branch)[::-1] for branch in paths])
 
     # Get list of the feature used at each node
     node_features = estimator.tree_.feature
@@ -50,23 +55,36 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
     for i_feature, feature in enumerate(features):
         feature_position = np.where(node_features == feature)[0]
         # Look for the position of this feature in each path
-        this_feature_depth = [np.where(np.in1d(path, feature_position))[0]
-                              for path in paths]
+        this_feature_depth = [np.where(np.in1d(branch, feature_position))[0]
+                              for branch in paths]
         # Get unique list of nodes at which the feature can be found
         this_feature_depth = np.unique(np.hstack(this_feature_depth))
         # Get threshold values
         thresholds_this_feature = thresholds[feature_position]
-        # Store mean depth, threshold values and number of nodes
+        # Store minimal depth, threshold values and number of nodes
         min_feature_depth[i_feature] = this_feature_depth.min()
         no_of_nodes[i_feature] = feature_position.shape[0]
         value_threshold[i_feature] = thresholds_this_feature.mean()
 
+    # Get list of conditional set of features up to each node
+    nodes_to_features = tuple([node_features[branch[:-1]] for branch in paths])
+    # Get pair of parent-child feature at each node in each branch
+    features_split = list()
+    for i_path, features_this_path in enumerate(nodes_to_features):
+        features_split.extend(np.vstack(([-1] + [features_this_path[i] for i in range(len(features_this_path) - 1)],
+                                         [features_this_path[i] for i in range(len(features_this_path))],
+                                         paths[i_path][:-1])).T)
+    # Convert to a pandas DataFrame, with unique rows
+    features_split = pd.DataFrame(np.unique(np.vstack(features_split).astype(int), axis=0), columns=['parent', 'child', 'node_idx'])
+
     # Store results
     with lock:
         results['tree_path'][i_tree] = paths
+        results['tree_feature_path'][i_tree] = nodes_to_features
         results['tree_depth'][i_tree] = max([len(i) for i in paths])
+        results['features_split'][i_tree] = features_split
         for i_feature, feature in enumerate(features):
-            feature_name = 'feature_%i' % (feature + 1)
+            feature_name = results['feature_names'][feature]
             results['feature_depth'][feature_name][i_tree] = min_feature_depth[i_feature]
             results['value_threshold'][feature_name][i_tree] = value_threshold[i_feature]
             results['no_of_nodes'][feature_name][i_tree] = no_of_nodes[i_feature]
@@ -110,8 +128,8 @@ def get_tree_paths(tree, node_id, depth=0):
     return paths
 
 
-def _compute_feature_contributions_from_tree(estimator, X_test, paths,
-                                             compute_conditional_contribution,
+def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
+                                             paths, compute_conditional_contributions,
                                              results, lock):
     """For a given tree estimator computes target frequency at the tree root
     and feature contributions, such that prediction ≈ target_frequency_at_root +
@@ -123,10 +141,11 @@ def _compute_feature_contributions_from_tree(estimator, X_test, paths,
 
     :param estimator: [object] The tree from which to calculate feature
         contributions.
-    :param X_test: [numpy array] Data on which to test feature contributions. It
+    :param i_tree: [int] The index of the tree in the ensemble model.
+    :param X: [numpy array] Data on which to test feature contributions. It
         must have the same number of features of the dataset used to train
         the model.
-    :param compute_conditional_contribution: [bool] Whether to also return all
+    :param compute_conditional_contributions: [bool] Whether to also return all
         the conditional contributions along the path.
 
     :return results: [dict] Contains:
@@ -137,43 +156,59 @@ def _compute_feature_contributions_from_tree(estimator, X_test, paths,
     - contributions: [numpy array] Contribution of each feature to each observation
         and target.
     - conditional_contributions: [dict] (optional if
-        `compute_conditional_contribution` == True) A dictionary containing
+        `compute_conditional_contributions` == True) A dictionary containing
         the values of contribution of each feature conditioned on previous
-        features. Each key contains the list of features along the decision
-        path, from the root down to the leaf. Each dictionary value contains
-        a numpy array containing the conditional contribution of each
-        feature to each observation.
+        features. The key is the index of the decision path. Each value contains
+        a numpy array of the conditional contribution of each feature to each
+        observation in that node.
     - conditional_contributions_samples: [dict] (optional if
-        `compute_conditional_contribution` == True) A dictionary with the same
-        keys of conditional_contributions. Instead of conditional contribution
-        values, it contains the index of the observations where the values of
-        conditional distributions were calculated. This dictionary could be used
-        to select only observations from the true class of interest.
+        `compute_conditional_contributions` == True) A dictionary with the same
+        keys of conditional_contributions. It contains the index of the
+        observations where the values of conditional contributions are calculated.
+        This information can be used to select subsets of observations in later
+        analyses.
     """
 
     # Get list of features used at each node
     node_features = estimator.tree_.feature
+    n_nodes = node_features.shape[0]
+    # If the tree did not perform any split, do not compute conditional contributions
+    n_splits = node_features[node_features >= 0].shape[0]
+    if n_splits < 1:
+        compute_conditional_contributions = False
 
     # Initialize output variables
-    contributions = np.zeros_like(results['contributions']) * np.nan
-    # Create the dictionaries containing the actual values of conditional
-    # contribution, and the index of the samples that ended up in each array
-    conditional_contributions = dict()
-    # conditional_contributions_samples = dict()
+    contributions = np.zeros_like(results['contributions'])
+    n_values = np.zeros((contributions.shape[1], ), dtype=int)
+
     # Initialize intermediate variables
-    path_to_features = None
+    conditional_contributions = None
+    conditional_contributions_lookup = None
+    conditional_contributions_sample = None
+    features_split = None
 
     # Retrieve leaves and paths
-    leaves_X = estimator.apply(X_test)
+    leaves_X = estimator.tree_.apply(X)
     # Map leaves to paths
     leaf_to_path = {path[-1]: path for path in paths}
 
     # The attribute `value` holds he amount of training samples that end up in
-    # the respective node for each class.
-    # Reference: https://stackoverflow.com/a/47719621
-    n_samples_in_node = estimator.tree_.value.squeeze(axis=1)
-    if n_samples_in_node.ndim == 0:
-        n_samples_in_node = np.array([n_samples_in_node])
+    # the respective node for each class (reference:
+    # https://stackoverflow.com/a/47719621). Instead of the following code,
+    # which works for training data only:
+    # n_samples_in_node = estimator.tree_.value.squeeze(axis=1)
+    # if n_samples_in_node.ndim == 0:
+    #     n_samples_in_node = np.array([n_samples_in_node])
+    # we'll use the `predict` method, which applies to dataset `X`. However, we
+    # need to split `X` by `y` to obtain the number of samples in each class that
+    # passed through each node.
+    targets = np.unique(y)
+    n_targets = len(targets)
+    n_samples_in_node = np.zeros((n_nodes, n_targets), dtype=float)
+    for i_col, target in enumerate(targets):
+        this_X = X[y == target, :]
+        decision_path = estimator.tree_.decision_path(this_X)
+        n_samples_in_node[:, i_col] = np.sum(decision_path, axis=0)
 
     # Compute target frequency at root of each target
     _, _, implementation, estimator_type = validate_model_type(estimator)
@@ -183,67 +218,123 @@ def _compute_feature_contributions_from_tree(estimator, X_test, paths,
                                         n_samples_in_node.sum(axis=1, keepdims=True),
                                         replace_with=0)
     else:
-        probabilities_in_node = n_samples_in_node
+        probabilities_in_node = n_samples_in_node.copy()
 
-    # If the tree did not perform any split, return immediately
-    if node_features[node_features >= 0].shape[0] == 0:
-        raise Exception
-        # if compute_conditional_contribution:
-        #     return predictions, target_frequency_at_root, contributions, None, None
-        # else:
-        #     return predictions, target_frequency_at_root, contributions
+    # Get the probability of each target at the root
+    target_probability_at_root = probabilities_in_node[paths[0][0]]
 
-    if compute_conditional_contribution:
-        # Map each path to the whole conditional set of features up to that node
-        path_to_features = {tuple(path): tuple(node_features[path[:-1]]) for
-                            path in paths}
+    if compute_conditional_contributions:
+        # Make arrays for conditional contributions
+        features_split = results['features_split'][i_tree].copy()
+        no_of_nodes = features_split.shape[0]
+        conditional_contributions = np.zeros((no_of_nodes, n_targets),
+                                             dtype=X.dtype) * np.nan
+        conditional_contributions_lookup = np.zeros((no_of_nodes, ), dtype=bool)
+        conditional_contributions_sample = dict()
+
+        # Convert DataFrame index for faster searching
+        features_split['row'] = features_split.index
+        features_split.set_index(features_split['node_idx'], inplace=True)
 
     # Compute contributions
     for i_obs, leaf in enumerate(leaves_X):
-        path = leaf_to_path[leaf]
-        # Compute absolute contribution of each feature at each node (that is, at each split)
-        contrib_features = probabilities_in_node[path[1:], :] - probabilities_in_node[path[:-1], :]
-        contrib_features_index = node_features[path[:-1]]
-        # Store data
-        contributions[i_obs, contrib_features_index, :] = np.sum(contrib_features, axis=0)
+        # Get path where this leaf is located
+        path = leaf_to_path[leaf].copy()
+        # Get final prediction
+        prediction = probabilities_in_node[leaf]
+        # Get values of probabilities at each node
+        contrib_features = probabilities_in_node[path, :].copy()
+
+        # Look for node where we get the closest to the prediction
+        stop_criterion = np.where(contrib_features[:, prediction.argmax()].astype(int) == 1)[0]
+        if stop_criterion.shape[0] > 0:
+            # Take earliest node where certainty was reached
+            stop_criterion = stop_criterion[0] + 1
+            # Prune current branch
+            contrib_features = contrib_features[:stop_criterion, :]
+            path = path[:stop_criterion]
+
+        # Get the indices of the nodes where this path is located
+        nodes_idx = path[:-1]
+
+        # Compute change in probability of each target at each node split along
+        # the current path. The sum of these values along the path and
+        # `target_probability_at_root` should approximate well the values of
+        # `prediction`.
+        delta_contributions = contrib_features[1:, :] - contrib_features[:-1, :]
+        # Get indices of features participating at each node in this path
+        features_index = node_features[path[:-1]]
+        # Store data. np.add.at() is equivalent to a[indices] += b, except that
+        # results are accumulated for elements that are indexed more than once
+        np.add.at(contributions[i_obs, :, :], features_index, delta_contributions)
+        np.add.at(n_values, features_index, 1)
 
         # Compute conditional contributions
-        if compute_conditional_contribution:
-            # Compute incremental contributions down the path, due by conditioning
-            # a feature preceding ones in the path
-            contrib_features_joint = np.cumsum(contrib_features, axis=0)
+        if compute_conditional_contributions:
+            # Store index of nodes for this observation
+            conditional_contributions_sample[i_obs] = features_split.loc[nodes_idx, 'row'].values
 
-            # Store values
-            features_at_this_node = path_to_features[tuple(path)]
-            if features_at_this_node in conditional_contributions.keys():
-                conditional_contributions[features_at_this_node] = \
-                    np.dstack((conditional_contributions[features_at_this_node],
-                               contrib_features_joint))
-                # conditional_contributions_samples[features_at_this_node].append(i_obs)
-            else:
-                conditional_contributions[features_at_this_node] = contrib_features_joint
-                # conditional_contributions_samples[features_at_this_node] = [i_obs]
+            # Continue only if there are nodes that we haven't stored
+            analyzed_nodes = conditional_contributions_lookup[features_split.loc[nodes_idx, 'row']]
+            if not analyzed_nodes.all():
+                # Get rows of nodes to analyze
+                nodes_to_analyze_idx = np.where(np.logical_not(analyzed_nodes))[0]
+                rows = features_split.loc[nodes_idx, 'row'].values[nodes_to_analyze_idx]
+
+                # Transform values into how much (in percentage) each split
+                # contributes to final prediction
+                distance_from_baseline_to_prediction = prediction - target_probability_at_root
+                conditional_contributions[rows, :] = divide0(delta_contributions[nodes_to_analyze_idx, :],
+                                                             distance_from_baseline_to_prediction * 100,
+                                                             replace_with=0)
+                # Toggle that we have analyzed these nodes
+                conditional_contributions_lookup[rows] = True
 
     # Store results
     with lock:
-        # Extract values of contributions, replace NaN with 0 and count number of non-NaN
+        # Extract values of contributions, replace NaN with 0 and count number
+        # of non-NaNs
         n = np.isfinite(contributions).astype(int)
         contributions[np.logical_not(np.isfinite(contributions))] = 0
         results['contributions'] += contributions
         results['contributions_n_evaluations'] += n
 
-        if compute_conditional_contribution:
-            # Add conditional contribution values and sample index of each
-            # contribution
-            feature_sets = list(conditional_contributions.keys())
-            for features in feature_sets:
-                if features in results['conditional_contributions'].keys():
-                    results['conditional_contributions'][features] = \
-                        np.dstack((results['conditional_contributions'][features],
-                                   conditional_contributions[features]))
-                else:
-                    results['conditional_contributions'] = conditional_contributions[features]
+        if compute_conditional_contributions:
+            # Store conditional contributions
+            results['conditional_contributions'][i_tree] = conditional_contributions
+            results['conditional_contributions_sample'][i_tree] = conditional_contributions_sample
 
+
+def _compute_two_way_conditional_contributions(samples, conditional_contributions,
+                                               conditional_contributions_sample,
+                                               features_split,
+                                               results, lock):
+
+    # Initialize heatmap-tables
+    dims = results['contribution_values'].shape
+    n_features = dims[0]
+    contribution_values = np.zeros(dims)
+    contribution_values_n = np.zeros_like(results['contribution_values_n'])
+
+    for this_sample in samples:
+        # Get the contribution values for this observation
+        rows = conditional_contributions_sample[this_sample]
+        this_contribution_values = conditional_contributions[rows, :]
+
+        # Find which features generated these values. These indices
+        # are coordinated in the heatmap, that is, children on rows,
+        # parents on columns
+        coords = features_split.loc[rows, ['child', 'parent']].values.T.tolist()
+        # Store values. np.add.at() is equivalent to a[indices] += b,
+        # except that results are accumulated for elements that are
+        # indexed more than once
+        np.add.at(contribution_values, coords, this_contribution_values)
+        np.add.at(contribution_values_n, coords, 1)
+
+    # Store results
+    with lock:
+        results['contribution_values'] += contribution_values
+        results['contribution_values_n'] += contribution_values_n
 
 
 def validate_model_type(model):
