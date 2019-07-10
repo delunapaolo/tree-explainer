@@ -1,5 +1,4 @@
 # String manipulation
-import re
 import warnings
 warnings.simplefilter('ignore', FutureWarning)
 
@@ -8,10 +7,16 @@ import numpy as np
 import pandas as pd
 
 # Local repository
+from tree_explainer.utilities.model_validation import validate_model_type
 from tree_explainer.utilities.numerical import divide0
 
+# The following variables mark leaves and undefined nodes. They can be
+# obtained with: from sklearn.tree._tree import TREE_LEAF, TREE_UNDEFINED
+TREE_LEAF = -1
+TREE_UNDEFINED = -2
 
-def _compute_tree_paths(estimator, i_tree, results, lock):
+
+def compute_tree_paths(estimator, i_tree, results, lock):
     """Get information about a tree model, such as the depth of the tree, the
     depth at which each feature is found, the number of nodes in the tree, and
     the threshold values used for splitting at each node.
@@ -31,12 +36,13 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
     - no_of_nodes: [dict] Each key (corresponding to a feature) contains
         the number of nodes in which the feature appears for splitting.
         Unused features are not listed.
-    - value_threshold: [dict] Each key (corresponding to a feature) contains
+    - threshold_value: [dict] Each key (corresponding to a feature) contains
         the threshold for splitting on a feature. Unused features are not
         listed.
     """
 
-    paths = get_tree_paths(estimator.tree_, node_id=0, depth=0)
+    paths, paths_sign = _get_tree_paths(estimator.tree_, node_id=0, depth=0)
+
     # Reverse direction of path, and convert to tuple
     paths = tuple([np.array(branch)[::-1] for branch in paths])
 
@@ -44,6 +50,9 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
     node_features = estimator.tree_.feature
     # Get list of thresholds used for each feature
     thresholds = estimator.tree_.threshold
+    # Get list of left and right children
+    left_children = estimator.tree_.children_left
+    right_children = estimator.tree_.children_right
 
     # Get the depth at which each feature is encountered, and the threshold
     # value used for the split
@@ -51,20 +60,14 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
     n_features = features.shape[0]
     min_feature_depth = np.zeros((n_features, ), dtype=np.int8)
     no_of_nodes = np.zeros((n_features, ), dtype=np.int8)
-    value_threshold = np.zeros((n_features, ), dtype=np.float32)
     for i_feature, feature in enumerate(features):
         feature_position = np.where(node_features == feature)[0]
         # Look for the position of this feature in each path
-        this_feature_depth = [np.where(np.in1d(branch, feature_position))[0]
-                              for branch in paths]
-        # Get unique list of nodes at which the feature can be found
-        this_feature_depth = np.unique(np.hstack(this_feature_depth))
-        # Get threshold values
-        thresholds_this_feature = thresholds[feature_position]
+        this_feature_depth = np.hstack([np.where(np.in1d(branch, feature_position))[0]
+                              for branch in paths])
         # Store minimal depth, threshold values and number of nodes
         min_feature_depth[i_feature] = this_feature_depth.min()
         no_of_nodes[i_feature] = feature_position.shape[0]
-        value_threshold[i_feature] = thresholds_this_feature.mean()
 
     # Get list of conditional set of features up to each node
     nodes_to_features = tuple([node_features[branch[:-1]] for branch in paths])
@@ -74,23 +77,39 @@ def _compute_tree_paths(estimator, i_tree, results, lock):
         features_split.extend(np.vstack(([-1] + [features_this_path[i] for i in range(len(features_this_path) - 1)],
                                          [features_this_path[i] for i in range(len(features_this_path))],
                                          paths[i_path][:-1])).T)
-    # Convert to a pandas DataFrame, with unique rows
+    # Convert to pandas DataFrame, with unique rows
     features_split = pd.DataFrame(np.unique(np.vstack(features_split).astype(int), axis=0), columns=['parent', 'child', 'node_idx'])
+    # Convert index for faster searching
+    features_split['row'] = features_split.index
+    features_split.set_index(features_split['node_idx'], inplace=True)
+    features_split.drop(columns=['node_idx'], inplace=True)
+
+    # Make a DataFrame of decisions made at each node, based on feature values
+    threshold_value = pd.DataFrame(np.vstack((node_features, thresholds, left_children, right_children)).T, columns=['feature_for_split', 'value', 'node_if_less_than', 'node_if_more_than'])
+    # Remove nodes corresponding to leaves
+    threshold_value.drop(index=np.where(thresholds == TREE_UNDEFINED)[0], inplace=True)
+    # Cast to correct data type
+    threshold_value['feature_for_split'] = threshold_value['feature_for_split'].map(int)
+    threshold_value['node_if_less_than'] = threshold_value['node_if_less_than'].map(int)
+    threshold_value['node_if_more_than'] = threshold_value['node_if_more_than'].map(int)
+    # Current index of DataFrame is the node id
+    threshold_value['node_id'] = threshold_value.index
+    threshold_value.reset_index(drop=True, inplace=True)
 
     # Store results
     with lock:
         results['tree_path'][i_tree] = paths
         results['tree_feature_path'][i_tree] = nodes_to_features
+        results['threshold_value'][i_tree] = threshold_value
         results['tree_depth'][i_tree] = max([len(i) for i in paths])
         results['features_split'][i_tree] = features_split
         for i_feature, feature in enumerate(features):
             feature_name = results['feature_names'][feature]
             results['feature_depth'][feature_name][i_tree] = min_feature_depth[i_feature]
-            results['value_threshold'][feature_name][i_tree] = value_threshold[i_feature]
             results['no_of_nodes'][feature_name][i_tree] = no_of_nodes[i_feature]
 
 
-def get_tree_paths(tree, node_id, depth=0):
+def _get_tree_paths(tree, node_id, depth=0):
     """Recursively navigate a tree model to gather the node_ids of each decision
     path.
 
@@ -99,38 +118,42 @@ def get_tree_paths(tree, node_id, depth=0):
     SOURCE: https://github.com/andosa/treeinterpreter/blob/master/treeinterpreter/treeinterpreter.py
     """
 
-    # The following variables mark leaves and undefined nodes. They can be
-    # obtained with: from sklearn.tree._tree import TREE_LEAF, TREE_UNDEFINED
-    TREE_LEAF = -1
-    # For the records, TREE_UNDEFINED = -2
-
     if node_id == TREE_LEAF:
-        raise ValueError("Invalid node_id %s" % node_id)
+        raise ValueError('Invalid node_id %s' % node_id)
 
     # Get the id of the left branch
     left_branch = tree.children_left[node_id]
     if left_branch != TREE_LEAF:  # we haven't reached a leaf yet
         # Follow path a level deeper on the left and the right branches
-        left_paths = get_tree_paths(tree, left_branch, depth=depth + 1)
+        left_paths, left_paths_sign = _get_tree_paths(tree, left_branch, depth=depth + 1)
         right_branch = tree.children_right[node_id]
-        right_paths = get_tree_paths(tree, right_branch, depth=depth + 1)
+        right_paths, right_paths_sign = _get_tree_paths(tree, right_branch, depth=depth + 1)
         # Append the if of the current node to all paths leading here
         for path in left_paths:
             path.append(node_id)
         for path in right_paths:
             path.append(node_id)
+        # Mark left and right children in path
+        for path in left_paths_sign:
+            path.append(0)
+        for path in right_paths_sign:
+            path.append(1)
         # Append the two lists
         paths = left_paths + right_paths
+        paths_sign = left_paths_sign + right_paths_sign
 
     else:  # This path has led to a leaf
         paths = [[node_id]]
+        paths_sign = [[-1]]
 
-    return paths
+    return paths, paths_sign
 
 
-def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
-                                             paths, compute_conditional_contributions,
-                                             results, lock):
+def compute_feature_contributions_from_tree(estimator, i_tree, data, targets,
+                                            paths, features_split,
+                                            compute_marginal_contributions,
+                                            compute_conditional_contributions,
+                                            results, lock):
     """For a given tree estimator computes target frequency at the tree root
     and feature contributions, such that prediction ≈ target_frequency_at_root +
     feature_contributions.
@@ -142,9 +165,10 @@ def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
     :param estimator: [object] The tree from which to calculate feature
         contributions.
     :param i_tree: [int] The index of the tree in the ensemble model.
-    :param X: [numpy array] Data on which to test feature contributions. It
+    :param data: [numpy array] Data on which to test feature contributions. It
         must have the same number of features of the dataset used to train
         the model.
+    :param features_split:
     :param compute_conditional_contributions: [bool] Whether to also return all
         the conditional contributions along the path.
 
@@ -178,17 +202,14 @@ def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
         compute_conditional_contributions = False
 
     # Initialize output variables
-    contributions = np.zeros_like(results['contributions'])
-    n_values = np.zeros((contributions.shape[1], ), dtype=int)
-
-    # Initialize intermediate variables
+    contributions = None
+    n_values = None
     conditional_contributions = None
     conditional_contributions_lookup = None
     conditional_contributions_sample = None
-    features_split = None
 
     # Retrieve leaves and paths
-    leaves_X = estimator.tree_.apply(X)
+    leaves_X = estimator.tree_.apply(data)
     # Map leaves to paths
     leaf_to_path = {path[-1]: path for path in paths}
 
@@ -199,15 +220,15 @@ def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
     # n_samples_in_node = estimator.tree_.value.squeeze(axis=1)
     # if n_samples_in_node.ndim == 0:
     #     n_samples_in_node = np.array([n_samples_in_node])
-    # we'll use the `predict` method, which applies to dataset `X`. However, we
-    # need to split `X` by `y` to obtain the number of samples in each class that
-    # passed through each node.
-    targets = np.unique(y)
-    n_targets = len(targets)
+    # we'll follow the `decision_path` of the new instances of `data`. However,
+    # we need to split `data` by `targets` to obtain the number of samples in
+    # each class that passed through each node.
+    target_levels = np.unique(targets)
+    n_targets = target_levels.shape[0]
     n_samples_in_node = np.zeros((n_nodes, n_targets), dtype=float)
-    for i_col, target in enumerate(targets):
-        this_X = X[y == target, :]
-        decision_path = estimator.tree_.decision_path(this_X)
+    for i_col, target in enumerate(target_levels):
+        this_target_data = data[targets == target, :]
+        decision_path = estimator.tree_.decision_path(this_target_data)
         n_samples_in_node[:, i_col] = np.sum(decision_path, axis=0)
 
     # Compute target frequency at root of each target
@@ -223,18 +244,17 @@ def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
     # Get the probability of each target at the root
     target_probability_at_root = probabilities_in_node[paths[0][0]]
 
+    # Initialize output variables
+    if compute_marginal_contributions:
+        contributions = np.zeros_like(results['contributions'])
+        n_values = np.zeros((contributions.shape[1], ), dtype=int)
+
     if compute_conditional_contributions:
         # Make arrays for conditional contributions
-        features_split = results['features_split'][i_tree].copy()
         no_of_nodes = features_split.shape[0]
-        conditional_contributions = np.zeros((no_of_nodes, n_targets),
-                                             dtype=X.dtype) * np.nan
+        conditional_contributions = np.zeros((no_of_nodes, n_targets)) * np.nan
         conditional_contributions_lookup = np.zeros((no_of_nodes, ), dtype=bool)
         conditional_contributions_sample = dict()
-
-        # Convert DataFrame index for faster searching
-        features_split['row'] = features_split.index
-        features_split.set_index(features_split['node_idx'], inplace=True)
 
     # Compute contributions
     for i_obs, leaf in enumerate(leaves_X):
@@ -245,59 +265,71 @@ def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
         # Get values of probabilities at each node
         contrib_features = probabilities_in_node[path, :].copy()
 
-        # Look for node where we get the closest to the prediction
-        stop_criterion = np.where(contrib_features[:, prediction.argmax()].astype(int) == 1)[0]
-        if stop_criterion.shape[0] > 0:
-            # Take earliest node where certainty was reached
-            stop_criterion = stop_criterion[0] + 1
-            # Prune current branch
-            contrib_features = contrib_features[:stop_criterion, :]
-            path = path[:stop_criterion]
-
-        # Get the indices of the nodes where this path is located
-        nodes_idx = path[:-1]
-
         # Compute change in probability of each target at each node split along
         # the current path. The sum of these values along the path and
         # `target_probability_at_root` should approximate well the values of
         # `prediction`.
         delta_contributions = contrib_features[1:, :] - contrib_features[:-1, :]
-        # Get indices of features participating at each node in this path
-        features_index = node_features[path[:-1]]
-        # Store data. np.add.at() is equivalent to a[indices] += b, except that
-        # results are accumulated for elements that are indexed more than once
-        np.add.at(contributions[i_obs, :, :], features_index, delta_contributions)
-        np.add.at(n_values, features_index, 1)
 
-        # Compute conditional contributions
+        # It can happen that node splits do not contribute to predict the values
+        # of this observation. In that case, contribution values for all targets
+        # are 0s
+        uninformative_nodes = np.all(delta_contributions == 0, axis=1)
+        if np.any(uninformative_nodes):
+            delta_contributions = np.delete(delta_contributions, np.where(uninformative_nodes)[0], axis=0)
+
+            # Shift all indices by 1 forward because `uninformative_nodes` refers
+            # to a difference array
+            nodes_to_keep = np.where(np.logical_not(np.hstack(([False], uninformative_nodes))))[0]
+            # Replace last informative node with the actual leaf
+            nodes_to_keep[-1] = path.shape[0] - 1
+            # Prune current branch, removing uninformative nodes
+            path = path[nodes_to_keep]
+
+        if compute_marginal_contributions:
+            # Get indices of features participating at each node in this path
+            features_index = node_features[path[:-1]]
+
+            # Store data. np.add.at() is equivalent to a[indices] += b, except
+            # that results are accumulated for elements that are indexed more
+            # than once
+            np.add.at(contributions[i_obs, :, :], features_index, delta_contributions)
+            np.add.at(n_values, features_index, 1)
+
         if compute_conditional_contributions:
+            # Get the indices of the nodes where this path is located
+            nodes_idx = path[:-1]
             # Store index of nodes for this observation
-            conditional_contributions_sample[i_obs] = features_split.loc[nodes_idx, 'row'].values
+            nodes_rows = features_split.loc[nodes_idx, 'row'].values
+            conditional_contributions_sample[i_obs] = nodes_rows
 
             # Continue only if there are nodes that we haven't stored
-            analyzed_nodes = conditional_contributions_lookup[features_split.loc[nodes_idx, 'row']]
+            analyzed_nodes = conditional_contributions_lookup[nodes_rows]
             if not analyzed_nodes.all():
                 # Get rows of nodes to analyze
                 nodes_to_analyze_idx = np.where(np.logical_not(analyzed_nodes))[0]
-                rows = features_split.loc[nodes_idx, 'row'].values[nodes_to_analyze_idx]
+                rows = nodes_rows[nodes_to_analyze_idx]
 
                 # Transform values into how much (in percentage) each split
                 # contributes to final prediction
                 distance_from_baseline_to_prediction = prediction - target_probability_at_root
                 conditional_contributions[rows, :] = divide0(delta_contributions[nodes_to_analyze_idx, :],
-                                                             distance_from_baseline_to_prediction * 100,
-                                                             replace_with=0)
+                                                             distance_from_baseline_to_prediction,
+                                                             replace_with=0) * 100
                 # Toggle that we have analyzed these nodes
                 conditional_contributions_lookup[rows] = True
 
     # Store results
     with lock:
-        # Extract values of contributions, replace NaN with 0 and count number
-        # of non-NaNs
-        n = np.isfinite(contributions).astype(int)
-        contributions[np.logical_not(np.isfinite(contributions))] = 0
-        results['contributions'] += contributions
-        results['contributions_n_evaluations'] += n
+        results['data_leaves'][:, i_tree] = leaves_X
+
+        if compute_marginal_contributions:
+            # Extract values of contributions, replace NaN with 0 and count number
+            # of non-NaNs
+            n = np.isfinite(contributions).astype(int)
+            contributions[np.logical_not(np.isfinite(contributions))] = 0
+            results['contributions'] += contributions
+            results['contributions_n_evaluations'] += n
 
         if compute_conditional_contributions:
             # Store conditional contributions
@@ -305,14 +337,13 @@ def _compute_feature_contributions_from_tree(estimator, i_tree, X, y,
             results['conditional_contributions_sample'][i_tree] = conditional_contributions_sample
 
 
-def _compute_two_way_conditional_contributions(samples, conditional_contributions,
-                                               conditional_contributions_sample,
-                                               features_split,
-                                               results, lock):
+def compute_two_way_conditional_contributions(samples, conditional_contributions,
+                                              conditional_contributions_sample,
+                                              features_split,
+                                              results, lock):
 
     # Initialize heatmap-tables
     dims = results['contribution_values'].shape
-    n_features = dims[0]
     contribution_values = np.zeros(dims)
     contribution_values_n = np.zeros_like(results['contribution_values_n'])
 
@@ -337,91 +368,88 @@ def _compute_two_way_conditional_contributions(samples, conditional_contribution
         results['contribution_values_n'] += contribution_values_n
 
 
-def validate_model_type(model):
-    """Get information on this model. If not recognized this function returns a
-    NotImplementedError error.
-
-    :param model: The input model.
-    :return model_class: [str] The model class (e.g., RandomForestClassifier).
-    :return model_type: [str] The type of model (i.e., 'classifier' or
-        'regressor').
-    :return implementation: [str] The package implementing the model (e.g.,
-        sklearn).
-    :return estimator_type: [str] The class of the estimator (e.g.,
-        DecisionTreeClassifier).
+def compute_explanation_of_prediction(leaf, paths, threshold_value, features_split,
+                                      conditional_contributions, prediction,
+                                      feature_values,
+                                      solve_duplicate_splits, results, lock):
     """
 
-    # List of known model types
-    KNOWN_MODEL_TYPES = [
-        # RandomForests
-        'sklearn.ensemble.forest.RandomForestClassifier',
-        'sklearn.ensemble.forest.RandomForestRegressor',
-        # Ensemble of extremely randomized trees
-        'sklearn.ensemble.forest.ExtraTreesClassifier',
-        'sklearn.ensemble.forest.ExtraTreesRegressor',
+    :param leaf:
+    :param paths:
+    :param threshold_value:
+    :param features_split:
+    :param conditional_contributions:
+    :param prediction:
+    :param feature_values:
+    :param solve_duplicate_splits:
+    :param results:
+    :param lock:
 
-        # Decision trees
-        'sklearn.tree.tree.DecisionTreeClassifier',
-        'sklearn.tree.tree.DecisionTreeRegressor',
-        # Extremely randomized trees
-        'sklearn.tree.tree.ExtraTreeClassifier',
-        'sklearn.tree.tree.ExtraTreeRegressor'
-        ]
-
-    # The class of the current model
-    model_class = str(type(model))
-    # Check class against known types
-    result = re.search('\'(.*)\'', model_class)
-    model_class_str = result.group(1)
-    if model_class_str in KNOWN_MODEL_TYPES:
-        # Infer class and package of origin of the model
-        model_class_parts = model_class_str.split('.')
-        model_class = model_class_parts[-1]
-        implementation = model_class_parts[0]
-
-        # Get type of estimator
-        if model_class == 'RandomForestClassifier':
-            estimator_type = 'DecisionTreeClassifier'
-        elif model_class == 'RandomForestRegressor':
-            estimator_type = 'DecisionTreeRegressor'
-        elif model_class == 'ExtraTreesClassifier':
-            estimator_type = 'ExtraTreeClassifier'
-        elif model_class == 'ExtraTreesRegressor':
-            estimator_type = 'ExtraTreeRegressor'
-        else:
-            estimator_type = model_class
-
-        # Get type of model
-        if 'classifier' in estimator_type.lower():
-            model_type = 'classifier'
-        elif 'regressor' in estimator_type.lower():
-            model_type = 'regressor'
-        else:
-            raise NotImplementedError('Not clear whether \'%s\' is a classifier or a regressor')
-
-        return model_class, model_type, implementation, estimator_type
-
-    else:
-        raise NotImplementedError('Class \'%s\' is not supported by TreeExplainer' % model_class_str)
-
-
-def validate_model_is_trained(model, model_type):
-    """Check whether the model has been already trained.
-
-    :param model: The input model.
-    :param model_type: [str] The model type (e.g., RandomForestClassifier).
-    :return Either nothing or an AttributeError.
+    :return:
     """
-    if model_type in ['RandomForestClassifier', 'RandomForestRegressor',
-                      'ExtraTreesClassifier', 'ExtraTreesRegressor']:
-        n_estimators_attr = 'n_estimators'
-        estimators_attr = 'estimators_'
 
-    else:
-        raise NotImplementedError('Don\'t know what to do with \'%s\'' % model_type)
+    # Get names of features
+    feature_names = list(feature_values.keys())
+    # Initialize output variables
+    samples_for_decision_table = dict({i: list() for i in feature_names})
+    contributions_for_decision_table = dict({i: list() for i in feature_names})
 
-    if hasattr(model, n_estimators_attr) and not hasattr(model, estimators_attr):
-        raise AttributeError('The model has not been trained yet, and thus cannot be explained.')
+    # Get the tree path which this observation followed
+    path_idx = np.where([np.any(np.in1d(path, leaf)) for path in paths])[0][0]
+    path = paths[path_idx]
 
-    else:
-        return n_estimators_attr, estimators_attr
+    # Get the sign of the operations performed at the nodes in which the
+    # observation was evaluated
+    rows = np.hstack([np.where(threshold_value['node_id'] == i)[0] for i in path[:-1]])
+    decision_nodes = threshold_value.loc[rows, ['node_if_less_than', 'node_if_more_than']].values
+    signs = np.hstack([np.where(i == j)[0] for i, j in zip(decision_nodes, path[1:])])
+
+    # Gather feature values that satisfy that condition
+    values = threshold_value.loc[rows].copy()
+    values['sign'] = signs
+    values.reset_index(drop=True, inplace=True)
+
+    # Add values of contribution
+    values['nodes_followed'] = [i[0] if i[2] == 0 else i[1] for i in values[
+        ['node_if_less_than', 'node_if_more_than', 'sign']].values]
+    nodes_followed = np.hstack((features_split.loc[0, 'row'], values['nodes_followed'][:-1].values))
+    cond_rows = features_split.loc[nodes_followed, 'row']
+    values['contribution'] = conditional_contributions[cond_rows, int(prediction)]
+    values.dropna(axis=0, how='any', inplace=True)
+    values.reset_index(drop=True, inplace=True)
+
+    # If a feature was evaluated more than once, apply a rule to select
+    # which piece of information to keep
+    if solve_duplicate_splits == 'none':
+        pass
+    elif solve_duplicate_splits == 'closest':
+        pass
+    elif solve_duplicate_splits == 'mean':
+        pass
+
+    # Make a tuple of the two comparison functions that have been used at each
+    # node split, that is, "less than or equal to" and "greater than". Below,
+    # the indices 0 and 1 will be assigned to these operations, which can be
+    # used to retrieve the correct function
+    comparisons = tuple((np.less_equal, np.greater))
+
+    # Store values of each node
+    for i_node in range(values.shape[0]):
+        row_data = values.loc[i_node]
+        # Get the appropriate function for comparison
+        this_comparison = comparisons[int(row_data['sign'])]
+        # Get the boolean indices where the comparison is True
+        feature_idx = int(row_data['feature_for_split'])
+        feature_name = feature_names[feature_idx]
+        feature_values_idx = this_comparison(feature_values[feature_name], row_data['value'])
+
+        # Store values
+        samples_for_decision_table[feature_name].extend(feature_values[feature_name][feature_values_idx])
+        contributions_for_decision_table[feature_name].append(row_data['contribution'])
+
+    # Store results
+    with lock:
+        for feature in feature_names:
+            results['samples_for_decision_table'][feature].extend(samples_for_decision_table[feature])
+            results['contributions_for_decision_table'][feature].extend(contributions_for_decision_table[feature])
+

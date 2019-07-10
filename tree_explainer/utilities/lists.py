@@ -1,5 +1,6 @@
 import re
 import numpy as np
+import pandas as pd
 
 
 def natural_sort(s):
@@ -10,9 +11,10 @@ def natural_sort(s):
     s.sort(key=alphanum_key)
     return s
 
+
 def true_list(iterable):
     """Convert anything to a list."""
-    if not isinstance(iterable, (list, np.ndarray)):
+    if not isinstance(iterable, (list, np.ndarray, pd.Index)):
         result = list([iterable])
 
     else:
