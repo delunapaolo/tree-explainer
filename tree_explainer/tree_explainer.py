@@ -244,40 +244,41 @@ class TreeExplainer(object):
 
 
     def explain_single_prediction(self, observation_idx, solve_duplicate_splits='mean',
-                                  threshold_contribution=0, top_n_features=None,
-                                  n_jobs=-1, verbose=False):
-        """
+                                  threshold_contribution=None, top_n_features=None,
+                                  n_jobs=-1):
+        """Analyze tree structure and try to explain how the model has reached a
+        certain prediction for a single observation. The idea is to look at how
+        each tree has used data features to partition the feature space, and
+        how that rule generalizes across trees.
 
-        :param observation_idx:
-        :param solve_duplicate_splits:
-        :param threshold_contribution:
-        :param top_n_features:
-        :param n_jobs:
-        :param verbose:
+        :param observation_idx: [int] The index of an observation in the stored
+            data
+        :param solve_duplicate_splits: [str] Not implemented yet.
+        :param threshold_contribution: [None or int] The threshold on
+            contribution values below which features will be hidden from the final
+            summary because uninformative. If None, nothing happens.
+        :param top_n_features: [int or None] The number of most informative
+            features, as measured by conditional contributions. If None,
+            nothing happens.
+        :param n_jobs: [int or None] The number of parallel processes to use if
+            joblib is installed. If None, trees are processed sequentially.
 
-        :return:
+        :return [str]: Prints message to console regarding the contribution of
+            features to a single prediction.
         """
 
         if self.data is None:
             raise ValueError('No data is present. First run the method explain_interactions()')
 
         # Get data of observation
-        this_sample = self.data[observation_idx, :]
-        # print(pd.Series(this_sample, self.feature_names))
-        # print('%s: \'%s\'' % (self.target_name, self.target_data_type[self.target_name]['categories'][self.predictions[observation_idx]]))
-
-        # Initialize output variables
-        decision_table = pd.DataFrame(columns=['value', 'center', 'lower', 'higher', 'contribution'],
-                                      index=self.feature_names)
+        this_sample_original = self.data[observation_idx, :]
+        this_sample = [str(i).rstrip('0') for i in this_sample_original]
         # Convert data of this sample
-        this_sample_original = this_sample.astype(str)
         for i_feature, feature in enumerate(self.feature_names):
             if self.features_data_types[feature]['data_type'] == 'numerical':
                 continue
             else:
-                this_sample_original[i_feature] = self.features_data_types[feature]['categories'][int(this_sample[i_feature])]
-        # Add it to decision table
-        decision_table['value'] = this_sample_original
+                this_sample[i_feature] = self.features_data_types[feature]['categories'][int(this_sample_original[i_feature])]
 
         # Gather unique values from each feature
         feature_values = dict({feature: list() for feature in self.feature_names})
@@ -289,7 +290,7 @@ class TreeExplainer(object):
         results['samples_for_decision_table'] = dict({i: list() for i in self.feature_names})
         results['contributions_for_decision_table'] = dict({i: list() for i in self.feature_names})
 
-        Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
+        Parallel(n_jobs=n_jobs, verbose=False, require='sharedmem')(
                 delayed(compute_explanation_of_prediction)(
                         leaf=self.data_leaves[observation_idx, i_tree],
                         paths=self.tree_path[i_tree],
@@ -307,53 +308,89 @@ class TreeExplainer(object):
         samples_for_decision_table = results['samples_for_decision_table']
         contributions_for_decision_table = results['contributions_for_decision_table']
 
+        # Initialize output variables
+        numerical_columns = ['lower quartile', 'median', 'upper quartile']
+        categorical_columns = ['1st choice', '2nd choice']
+        # Split numerical from categorical features
+        numerical_features = [feature for feature in self.feature_names
+                              if self.features_data_types[feature]['data_type'] == 'numerical']
+        categorical_features = list(set(self.feature_names).difference(numerical_features))
+        # Make DataFrames
+        decision_table_numerical = pd.DataFrame(columns=['value'] + numerical_columns + ['contribution'],
+                                      index=numerical_features)
+        decision_table_categorical = pd.DataFrame(columns=['value'] + categorical_columns + ['contribution'],
+                                                  index=categorical_features)
+        # Create function for filling the categorical DataFrame
+        fill_categorical_values = lambda x, y: '%s (%i%%)' % (x, y * 100) if x != '' else ''
+        fill_contribution_values = lambda x: '%.1f%%' % x
+
         # Compute summary statistics for each feature
         for feature in self.feature_names:
             samples = np.array(samples_for_decision_table[feature])
 
             # Check data type
-            if self.features_data_types[feature]['data_type'] in ['ordinal', 'nominal']:
+            if feature in categorical_features:
                 # Convert indices to values
                 samples_value = self.features_data_types[feature]['categories'][samples.astype(int)]
-                samples_value = pd.Series(samples_value)
-                mode = samples_value.mode(dropna=True)[0]
-                lower = samples_value.min(skipna=True)
-                higher = samples_value.max(skipna=True)
-                # Concatenate values
-                q = [lower, mode, higher]
+                category_frequencies = pd.value_counts(samples_value, ascending=False, normalize=True)
+                # Take the top 3 choices
+                choices = list(category_frequencies.index)
+                first_choice = choices[0]
+                second_choice = choices[1] if len(choices) > 1 else ''
+                # third_choice = choices[2] if len(choices) > 2 else ''
 
-            else:
+                # Take their frequency value
+                category_frequencies = category_frequencies.values
+                if category_frequencies.shape[0] < 2:
+                    category_frequencies = np.hstack((category_frequencies,
+                                                      np.zeros((2 - category_frequencies.shape[0], ))))
+
+                # Store values in nice format
+                decision_table_categorical.loc[feature, '1st choice'] = fill_categorical_values(first_choice, category_frequencies[0])
+                decision_table_categorical.loc[feature, '2nd choice'] = fill_categorical_values(second_choice, category_frequencies[1])
+                # decision_table_categorical.loc[feature, '3rd choice'] = fill_categorical_values(third_choice, category_frequencies[2])
+
+                # Store median contribution
+                decision_table_categorical.loc[feature, 'contribution'] = np.median(contributions_for_decision_table[feature])
+
+            elif feature in numerical_features:
                 # Compute quartiles
                 q = np.quantile(samples, [.25, .50, .75], interpolation='nearest')
+                decision_table_numerical.loc[feature, ['lower quartile', 'median', 'upper quartile']] = q
 
-            # Store ranges
-            decision_table.loc[feature, ['lower', 'center', 'higher']] = q
-            # Store median contribution
-            decision_table.loc[feature, 'contribution'] = np.median(contributions_for_decision_table[feature])
+                # Store median contribution
+                decision_table_numerical.loc[feature, 'contribution'] = np.median(contributions_for_decision_table[feature])
+
+        # Add sample of interest to decision table
+        decision_table_numerical['value'] = [this_sample[self.feature_names.index(i)] for i in numerical_features]
+        decision_table_categorical['value'] = [this_sample[self.feature_names.index(i)] for i in categorical_features]
 
         # Sort decision table by contribution value
-        decision_table.sort_values(by='contribution', ascending=False, inplace=True)
+        decision_table_numerical.sort_values(by='contribution', ascending=False, inplace=True)
+        decision_table_categorical.sort_values(by='contribution', ascending=False, inplace=True)
 
         # Limit number of features used to explain this prediction
-        features_to_drop = np.ones((decision_table.shape[0], ), dtype=bool)
         if threshold_contribution is not None:
-            features_to_drop = features_to_drop & \
-                               (decision_table['contribution'] >= threshold_contribution).values
+            decision_table_numerical = decision_table_numerical.loc[decision_table_numerical['contribution'] >= threshold_contribution]
+            decision_table_categorical = decision_table_categorical.loc[decision_table_categorical['contribution'] >= threshold_contribution]
+
         if top_n_features is not None:
-            features_to_drop = features_to_drop & \
-                               np.hstack((np.ones((top_n_features, )), np.zeros((decision_table.shape[0] - top_n_features, )))).astype(bool)
+            decision_table_numerical = decision_table_numerical.iloc[:top_n_features]
+            decision_table_categorical = decision_table_categorical.iloc[:top_n_features]
 
-        print(decision_table.iloc[np.where(features_to_drop)[0]])
-        print()
+        # Convert contribution column to string
+        decision_table_numerical['contribution'] = decision_table_numerical['contribution'].map(fill_contribution_values)
+        decision_table_categorical['contribution'] = decision_table_categorical['contribution'].map(fill_contribution_values)
 
-
-
-
-
-
-
-
-
+        # Print to console
+        with pd.option_context('display.max_rows', None, 'display.max_columns', None):
+            outcome = self.target_data_type[self.target_name]['categories'][int(self.predictions[observation_idx])]
+            is_correct = 'correct' if self.correct_predictions[observation_idx] else 'not correct'
+            print('\nObservation #%i: %s = \'%s\' (%s)\n' % (observation_idx, self.target_name, outcome, is_correct))
+            print(decision_table_numerical)
+            print()
+            print(decision_table_categorical)
+            print()
 
 
     def _process_and_predict(self, data, targets=None, calling_method=None):
