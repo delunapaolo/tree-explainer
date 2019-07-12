@@ -65,7 +65,7 @@ class TreeExplainer(object):
         results['threshold_value'] = list(np.empty((self.n_trees,), dtype=object))
         results['no_of_nodes'] = {f: np.zeros((self.n_trees,), dtype=int) - 1 for f in results['feature_names']}
         # Process trees in parallel
-        Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
+        Parallel(n_jobs=n_jobs, require='sharedmem')(
                 delayed(compute_tree_paths)(
                         estimator=estimator, i_tree=i_tree,
                         results=results, lock=threading.Lock())
@@ -148,7 +148,7 @@ class TreeExplainer(object):
         results['contributions'] = np.zeros((self.n_samples, self.n_features, self.n_target_levels), dtype=np.float32)
         results['contributions_n_evaluations'] = np.zeros((self.n_samples, self.n_features, self.n_target_levels), dtype=np.float32)
         # Process trees in parallel
-        Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
+        Parallel(n_jobs=n_jobs, require='sharedmem')(
                 delayed(compute_feature_contributions_from_tree)(
                         estimator=estimator, i_tree=i_tree,
                         data=self.data, targets=self.targets,
@@ -221,7 +221,7 @@ class TreeExplainer(object):
         results['conditional_contributions'] = list([np.zeros((i, self.n_target_levels)) for i in no_of_nodes_per_tree])
         results['conditional_contributions_sample'] = list(np.empty((self.n_trees, ), dtype=object))
         # Process trees in parallel
-        Parallel(n_jobs=n_jobs, verbose=verbose, require='sharedmem')(
+        Parallel(n_jobs=n_jobs, require='sharedmem')(
                 delayed(compute_feature_contributions_from_tree)(
                         estimator=estimator, i_tree=i_tree,
                         data=self.data, targets=self.targets,
@@ -393,6 +393,10 @@ class TreeExplainer(object):
             print()
 
 
+    def explain_correct_predictions(self):
+        print()
+
+
     def _process_and_predict(self, data, targets=None, calling_method=None):
         # Process input data
         DP = DataProcessor().prepare(data=data, targets=targets)
@@ -429,7 +433,6 @@ class TreeExplainer(object):
         self.target_data_type = DP.info['target_data_type']
 
         # Initialize other attributes that depend on data
-        self.n_samples = None
         self.predictions = None
         self.correct_predictions = None
         self.contributions = None
