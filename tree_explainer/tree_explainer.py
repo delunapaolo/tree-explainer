@@ -1,6 +1,5 @@
 # Standard
 import threading
-from warnings import warn
 
 # Numerical
 import numpy as np
@@ -16,8 +15,8 @@ import seaborn as sns
 # Local repo
 from utilities.preprocessing import DataProcessor
 from utilities.model_validation import validate_model_type, validate_model_is_trained
-from utilities.parallel import compute_tree_paths
 from utilities.parallel import compute_feature_contributions_from_tree
+from utilities.parallel import analyze_tree_structure
 from utilities.parallel import compute_two_way_conditional_contributions
 from utilities.parallel import compute_explanation_of_prediction
 from tree_explainer.utilities.numerical import divide0
@@ -27,13 +26,25 @@ from tree_explainer.utilities.lists import true_list
 
 ################################################################################
 class TreeExplainer(object):
-    def __init__(self, model, n_jobs=-1, verbose=False):
+    def __init__(self, model, data, targets=None, n_jobs=None, verbose=False):
         """The class is instantiated by passing model to train and training data.
         Optionally, feature names and target names can be passed, too.
 
-        :param model: The input model to explain.
+        :param model: The input model to explain_feature_contributions.
+        :param data: [numpy array or pandas DataFrame] Data on which to test
+            feature contributions. It must have the same number of features of
+            the dataset used to train the model. It should be scaled in the same
+            way as the training data.
+        :param targets: [numpy array] True target values of each instance in
+            `data`. For classification tasks, it contains the class labels, for
+            regression problems the true value.
         :param n_jobs: [int or None] The number of parallel processes to use.
-        :param verbose: [bool] Whether to print progress to the console.
+        :param verbose: [bool or int] Whether to print progress to the console.
+            If it equals False, no message will be printed; if it equals 1,
+            1, progress messages will be displayed; if it equals True or 2,
+            messages from joblib will also be displayed.
+
+        :return self:
         """
 
         # Check that model type is supported
@@ -41,38 +52,87 @@ class TreeExplainer(object):
         # Check that model has been fit, and get information from it
         n_estimators_attr, estimators_attr = validate_model_is_trained(model, model_class)
 
-        if verbose:
-            print('Analyzing model structure ...')
+        # Store the state of verbosity and the number of cores to use for joblib
+        if isinstance(verbose, bool):
+            if verbose:
+                self.verbosity_level = 2
+            else:
+                self.verbosity_level = 0
+        elif isinstance(verbose, (int, float)):
+            self.verbosity_level = int(round(verbose))
+        else:
+            self.verbosity_level = 0
+        self.joblib_params = dict(n_jobs=n_jobs, verbose=self.verbosity_level == 2)
+
+        if self.verbosity_level > 0:
+            print('Analyzing model structure and computing feature contributions ...')
         # Keep a reference to these attributes of the model
-        self._internals = dict(model_class=model_class,
-                               model_type=model_type,
-                               implementation=implementation,
-                               estimator_type=estimator_type,
-                               estimators_=estimators_attr,
-                               n_estimators=n_estimators_attr)
+        self._model_specifics = dict(model_class=model_class,
+                                     model_type=model_type,
+                                     implementation=implementation,
+                                     estimator_type=estimator_type,
+                                     estimators_=estimators_attr,
+                                     n_estimators=n_estimators_attr)
         # Initialize basic attributes of the model
         self.model = model
-        self.n_trees = getattr(model, self._internals['n_estimators'])
+        self.n_trees = getattr(model, self._model_specifics['n_estimators'])
         self.n_features = model.n_features_
 
-        # Extract decision path of each tree in model
-        results = dict(feature_names=np.arange(self.n_features))
-        results['tree_path'] = list(np.empty((self.n_trees, ), dtype=object))
+        # Initialize attributes
+        self.data = None
+        self.targets = None
+        self.tree_path = None
+        self.features_split = list(np.empty((self.n_trees, ), dtype=object))
+        self.tree_feature_path = None
+        self.tree_depth = None
+        self.feature_depth = None
+        self.threshold_value = None
+        self.no_of_nodes = None
+        self.data_leaves = None
+        self.target_probability_at_root = None
+        self.contributions = None
+        self.conditional_contributions = None
+        self.conditional_contributions_sample = None
+        self.min_depth_frame = None
+        self.min_depth_frame_summary = None
+        self.importance_frame = None
+        self.two_way_contribution_table = None
+        self.n_two_way_contribution_table = None
+
+        # Prepare data
+        self._prepare_data_and_predict(data=data, targets=targets)
+
+
+    def analyze_tree_structure(self):
+        """
+
+        :return:
+        """
+        # Allocate variables
+        results = dict()
+        if self.tree_path is None:
+            store_tree_path = True
+            results['tree_path'] = list(np.empty((self.n_trees, ), dtype=object))
+        else:
+            store_tree_path = False
         results['features_split'] = list(np.empty((self.n_trees, ), dtype=object))
         results['tree_feature_path'] = list(np.empty((self.n_trees,), dtype=object))
         results['tree_depth'] = np.zeros((self.n_trees, ), dtype=int)
-        results['feature_depth'] = {f: np.zeros((self.n_trees, ), dtype=int) - 1 for f in results['feature_names']}
+        results['feature_depth'] = {f: np.zeros((self.n_trees, ), dtype=int) - 1 for f in self.feature_names}
         results['threshold_value'] = list(np.empty((self.n_trees,), dtype=object))
-        results['no_of_nodes'] = {f: np.zeros((self.n_trees,), dtype=int) - 1 for f in results['feature_names']}
+        results['no_of_nodes'] = {f: np.zeros((self.n_trees,), dtype=int) - 1 for f in self.feature_names}
+
         # Process trees in parallel
-        Parallel(n_jobs=n_jobs, require='sharedmem')(
-                delayed(compute_tree_paths)(
-                        estimator=estimator, i_tree=i_tree,
+        Parallel(**self.joblib_params, require='sharedmem')(
+                delayed(analyze_tree_structure)(
+                        estimator=estimator, feature_names=self.feature_names,
+                        store_tree_path=store_tree_path, i_tree=i_tree,
                         results=results, lock=threading.Lock())
-                for i_tree, estimator in enumerate(getattr(model, self._internals['estimators_'])))
+                for i_tree, estimator in enumerate(getattr(self.model, self._model_specifics['estimators_'])))
 
         # Store results
-        self.tree_path = results['tree_path']
+        if store_tree_path:
+            self.tree_path = results['tree_path']
         self.features_split = results['features_split']
         self.tree_feature_path = results['tree_feature_path']
         self.tree_depth = results['tree_depth']
@@ -80,173 +140,65 @@ class TreeExplainer(object):
         self.threshold_value = results['threshold_value']
         self.no_of_nodes = results['no_of_nodes']
 
-        # Initialize all other TreeExplainer's attributes. Initialized explicitly
-        # to silence warnings of interpreters.
-        self.data = None
-        self.targets = None
-        self.n_samples = None
-        self.predictions = None
-        self.correct_predictions = None
-        self.contributions = None
-        self.conditional_contributions = None
-        self.feature_combinations = None
-        self.conditional_contributions_sample = None
-        self.data_leaves = None
-        self.min_depth_frame = None
-        self.min_depth_frame_summary = None
-        self.importance_frame = None
-        self.two_way_contribution_table = None
-        self.n_two_way_contribution_table = None
-
-        if verbose:
-            print('done')
-
-
-    def explain_features(self, data, targets=None, n_jobs=-1, verbose=False):
-        """Main method to explain the provided predictions of the model. It
-        computes feature contributions, such that:
-        predictions ≈ target_frequency_at_root + feature_contributions.
-
-        REFERENCE: This function is based on _predict_forest in the python
-        package treeinterpreter.
-        SOURCE: https://github.com/andosa/treeinterpreter/blob/master/treeinterpreter/treeinterpreter.py
-
-        :param data: [numpy array or pandas DataFrame] Data on which to test
-            feature contributions. It must have the same number of features of
-            the dataset used to train the model. It should be scaled in the same
-            way as the training data.
-        :param targets: [numpy array] True target values of each instance in
-            `data`. For classification tasks, it contains the class labels, for
-            regression problems the true value.
-        :param n_jobs: [int or None] The number of parallel processes to use if
-            joblib is installed. If None, trees are processed sequentially.
-        :param verbose: [bool] Whether to print messages to the console regarding
-            progress and outcomes.
-
-        :return self: This allows the user to call this method together with
-            initialization, and return the object in a variable, that is,
-            TE = TreeExplainer(model).explain(X_test)
-
-        The following attributes are stored in self:
-        target_frequency_at_root: [numpy array] Contains the baseline prediction
-            of each feature to each observation and class, averaged across trees.
-        contributions: [numpy array] Contains the contribution of each feature
-            to each observation and class, averaged across trees.
-        """
-
-        # Prepare data
-        if verbose:
-            print('Pre-processing data ...')
-        self._process_and_predict(data=data, targets=targets, calling_method='explain_features')
-
-        if verbose:
-            print('Computing feature contributions ...')
-        # Compute contributions
-        results = dict()
-        results['data_leaves'] = np.zeros((self.n_samples, self.n_trees), dtype=int)
-        results['tree_path'] = list(np.empty((self.n_trees,), dtype=object))
-        results['contributions'] = np.zeros((self.n_samples, self.n_features, self.n_target_levels), dtype=np.float32)
-        results['contributions_n_evaluations'] = np.zeros((self.n_samples, self.n_features, self.n_target_levels), dtype=np.float32)
-        # Process trees in parallel
-        Parallel(n_jobs=n_jobs, require='sharedmem')(
-                delayed(compute_feature_contributions_from_tree)(
-                        estimator=estimator, i_tree=i_tree,
-                        data=self.data, targets=self.targets,
-                        paths=self.tree_path[i_tree], features_split=None,
-                        compute_marginal_contributions=True,
-                        compute_conditional_contributions=False,
-                        results=results, lock=threading.Lock())
-                for i_tree, estimator in enumerate(getattr(self.model, self._internals['estimators_'])))
-
-        if np.any(results['contributions_n_evaluations'] == 0):
-            n_not_evaluated_features = np.unique(np.where(results['contributions_n_evaluations'] == 0)[1]).shape[0]
-            warn('%i out %i (%.1f%%) features were never evaluated by the model.\nConsider increasing the number of estimators' % (
-                    n_not_evaluated_features, results['contributions_n_evaluations'].shape[1], n_not_evaluated_features / results['contributions_n_evaluations'].shape[1] * 100))
-
-        # Divide contributions only by the number of times the feature was evaluated.
-        # Features that were never evaluated will return NaN
-        self.contributions = divide0(results['contributions'], results['contributions_n_evaluations'],
-                                     replace_with=np.nan)
-        self.data_leaves = results['data_leaves']
-
-        if verbose:
+        if self.verbosity_level > 0:
             print('done')
 
         return self
 
 
-    def explain_interactions(self, data, targets=None, n_jobs=-1, verbose=False):
-        """Main method to explain conditional contributions (that is,
-        interactions) between features in the data.
-
-        REFERENCE: This function is loosely based on _predict_forest in the python
-        package treeinterpreter.
-        SOURCE: https://github.com/andosa/treeinterpreter/blob/master/treeinterpreter/treeinterpreter.py
-
-        :param data: [numpy array or pandas DataFrame] Data on which to test
-            feature contributions. It must have the same number of features of
-            the dataset used to train the model. It should be scaled in the same
-            way as the training data.
-        :param targets: [numpy array] True target values of each instance in
-            `data`. For classification tasks, it contains the class labels, for
-            regression problems the true value.
-        :param n_jobs: [int or None] The number of parallel processes to use if
-            joblib is installed. If None, trees are processed sequentially.
-        :param verbose: [bool] Whether to print messages to the console regarding
-            progress and outcomes.
-
-        :return self: This allows the user to call this method together with
-            initialization, and return the object in a variable, that is,
-            TE = TreeExplainer(model).explain_interactions(X_test)
-
-        The following attributes are stored in self:
-        conditional_contributions: [dict] A dictionary containing the values of
-            contribution of each feature conditioned on previous features. Each
-            key contains the list of features along the decision path, from the
-            root down to the leaf. Each dictionary value contains a numpy array
-            containing the conditional contribution of each feature to each
-            observation, averaged across trees.
+    def explain_feature_contributions(self, joint_contributions=False,
+                                      ignore_non_informative_nodes=False):
         """
 
-        # Preprocess and store data
-        self._process_and_predict(data=data, targets=targets, calling_method='explain_interactions')
+        :param joint_contributions: [bool] Whether to compute the joint
+            contribution between features.
+        :param ignore_non_informative_nodes: [bool] Whether to exclude from
+            averaging the nodes where contribution values did not change. In this
+            way, the mean is only computed over the nodes where a feature was
+            effectively evaluated.
+        """
 
-        if verbose:
-            print('Computing conditional feature contributions ...')
-
-        # Compute contributions
-        results = dict()
-        results['data_leaves'] = np.zeros((self.n_samples, self.n_trees), dtype=int)
-        no_of_nodes_per_tree = [i.shape[0] for i in self.features_split]
-        results['conditional_contributions'] = list([np.zeros((i, self.n_target_levels)) for i in no_of_nodes_per_tree])
-        results['conditional_contributions_sample'] = list(np.empty((self.n_trees, ), dtype=object))
         # Process trees in parallel
-        Parallel(n_jobs=n_jobs, require='sharedmem')(
+        results = Parallel(**self.joblib_params, require='sharedmem')(
                 delayed(compute_feature_contributions_from_tree)(
-                        estimator=estimator, i_tree=i_tree,
-                        data=self.data, targets=self.targets,
-                        paths=self.tree_path[i_tree],
+                        estimator=estimator, data=self.data,
+                        contributions_shape=(self.n_samples, self.n_features, self.n_target_levels),
                         features_split=self.features_split[i_tree],
-                        compute_marginal_contributions=False,
-                        compute_conditional_contributions=True,
-                        results=results, lock=threading.Lock())
-                for i_tree, estimator in enumerate(getattr(self.model, self._internals['estimators_'])))
+                        joint_contributions=joint_contributions,
+                        ignore_non_informative_nodes=ignore_non_informative_nodes)
+                for i_tree, estimator in enumerate(getattr(self.model, self._model_specifics['estimators_'])))
 
-        # Store conditional contributions
-        self.conditional_contributions = results['conditional_contributions']
-        self.conditional_contributions_sample = results['conditional_contributions_sample']
-        self.data_leaves = results['data_leaves']
+        # Unpack `results`
+        if self.tree_path is None:
+            self.tree_path = [i['tree_path'] for i in results]
+        self.data_leaves = np.vstack([i['data_leaves'] for i in results]).transpose()
+        self.target_probability_at_root = np.vstack([i['target_probability_at_root'] for i in results])
 
-        if verbose:
+        # Divide contributions only by the number of times the feature was evaluated.
+        # Features that were never evaluated will return NaN
+        if ignore_non_informative_nodes:
+            denominator = np.sum(np.stack([i['contributions_n_evaluations'] for i in results], axis=3), axis=3)
+        else:
+            denominator = self.n_trees  # Normalized by all trees
+        self.contributions = divide0(np.sum(np.stack([i['contributions'] for i in results], axis=3), axis=3),
+                                     denominator,
+                                     replace_with=np.nan)
+
+        if joint_contributions:
+            self.conditional_contributions = [i['conditional_contributions'] for i in results]
+            self.conditional_contributions_sample = [i['conditional_contributions_sample'] for i in results]
+            if self.features_split[0] is None:  # If the first is empty, then all are
+                self.features_split = [i['features_split'] for i in results]
+
+        if self.verbosity_level > 0:
             print('done')
 
         return self
 
 
     def explain_single_prediction(self, observation_idx, solve_duplicate_splits='mean',
-                                  threshold_contribution=None, top_n_features=None,
-                                  n_jobs=-1):
-        """Analyze tree structure and try to explain how the model has reached a
+                                  threshold_contribution=None, top_n_features=None):
+        """Analyze tree structure and try to explain_feature_contributions how the model has reached a
         certain prediction for a single observation. The idea is to look at how
         each tree has used data features to partition the feature space, and
         how that rule generalizes across trees.
@@ -260,25 +212,25 @@ class TreeExplainer(object):
         :param top_n_features: [int or None] The number of most informative
             features, as measured by conditional contributions. If None,
             nothing happens.
-        :param n_jobs: [int or None] The number of parallel processes to use if
-            joblib is installed. If None, trees are processed sequentially.
 
         :return [str]: Prints message to console regarding the contribution of
             features to a single prediction.
         """
 
-        if self.data is None:
+        if self.data is None or self.conditional_contributions is None:
             raise ValueError('No data is present. First run the method explain_interactions()')
 
         # Get data of observation
         this_sample_original = self.data[observation_idx, :]
-        this_sample = [str(i).rstrip('0') for i in this_sample_original]
+        this_sample = list(this_sample_original)
         # Convert data of this sample
         for i_feature, feature in enumerate(self.feature_names):
             if self.features_data_types[feature]['data_type'] == 'numerical':
-                continue
+                this_sample[i_feature] = '%.3f' % this_sample_original[i_feature]
             else:
                 this_sample[i_feature] = self.features_data_types[feature]['categories'][int(this_sample_original[i_feature])]
+        # Remove trailing zeros
+        this_sample = [str(i).rstrip('0') for i in this_sample]
 
         # Gather unique values from each feature
         feature_values = dict({feature: list() for feature in self.feature_names})
@@ -286,11 +238,11 @@ class TreeExplainer(object):
             feature_values[feature] = np.unique(self.data[:, i_feature])
 
         # Process trees in parallel
-        results = dict()
-        results['samples_for_decision_table'] = dict({i: list() for i in self.feature_names})
-        results['contributions_for_decision_table'] = dict({i: list() for i in self.feature_names})
+        # results = dict()
+        # results['samples_for_decision_table'] = dict({i: list() for i in self.feature_names})
+        # results['contributions_for_decision_table'] = dict({i: list() for i in self.feature_names})
 
-        Parallel(n_jobs=n_jobs, verbose=False, require='sharedmem')(
+        results = Parallel(**self.joblib_params)(
                 delayed(compute_explanation_of_prediction)(
                         leaf=self.data_leaves[observation_idx, i_tree],
                         paths=self.tree_path[i_tree],
@@ -299,14 +251,17 @@ class TreeExplainer(object):
                         conditional_contributions=self.conditional_contributions[i_tree],
                         prediction=self.predictions[observation_idx],
                         feature_values=feature_values,
-                        solve_duplicate_splits=solve_duplicate_splits,
-                        results=results,
-                        lock=threading.Lock())
+                        solve_duplicate_splits=solve_duplicate_splits)
                 for i_tree in range(self.n_trees))
 
         # Extract data
-        samples_for_decision_table = results['samples_for_decision_table']
-        contributions_for_decision_table = results['contributions_for_decision_table']
+        all_samples_for_decision_table = [i['samples_for_decision_table'] for i in results]
+        all_contributions_for_decision_table = [i['contributions_for_decision_table'] for i in results]
+        samples_for_decision_table = dict()
+        contributions_for_decision_table = dict()
+        for feature in self.feature_names:
+            samples_for_decision_table[feature] = np.hstack([i[feature] for i in all_samples_for_decision_table])
+            contributions_for_decision_table[feature] = np.hstack([i[feature] for i in all_contributions_for_decision_table])
 
         # Initialize output variables
         numerical_columns = ['lower quartile', 'median', 'upper quartile']
@@ -318,9 +273,10 @@ class TreeExplainer(object):
         # Make DataFrames
         decision_table_numerical = pd.DataFrame(columns=['value'] + numerical_columns + ['contribution'],
                                       index=numerical_features)
-        decision_table_categorical = pd.DataFrame(columns=['value'] + categorical_columns + ['contribution'],
+        decision_table_categorical = pd.DataFrame(columns=['parent_feature', 'value'] + categorical_columns + ['contribution'],
                                                   index=categorical_features)
         # Create function for filling the categorical DataFrame
+        fill_numerical_values = lambda x: '%.3f' % x
         fill_categorical_values = lambda x, y: '%s (%i%%)' % (x, y * 100) if x != '' else ''
         fill_contribution_values = lambda x: '%.1f%%' % x
 
@@ -337,7 +293,6 @@ class TreeExplainer(object):
                 choices = list(category_frequencies.index)
                 first_choice = choices[0]
                 second_choice = choices[1] if len(choices) > 1 else ''
-                # third_choice = choices[2] if len(choices) > 2 else ''
 
                 # Take their frequency value
                 category_frequencies = category_frequencies.values
@@ -348,16 +303,19 @@ class TreeExplainer(object):
                 # Store values in nice format
                 decision_table_categorical.loc[feature, '1st choice'] = fill_categorical_values(first_choice, category_frequencies[0])
                 decision_table_categorical.loc[feature, '2nd choice'] = fill_categorical_values(second_choice, category_frequencies[1])
-                # decision_table_categorical.loc[feature, '3rd choice'] = fill_categorical_values(third_choice, category_frequencies[2])
-
                 # Store median contribution
                 decision_table_categorical.loc[feature, 'contribution'] = np.median(contributions_for_decision_table[feature])
+                # Store name of parent feature, if any
+                if 'parent_feature' in self.features_data_types[feature].keys():
+                    parent_feature = self.features_data_types[feature]['parent_feature']
+                else:
+                    parent_feature = None
+                decision_table_categorical.loc[feature, 'parent_feature'] = parent_feature
 
             elif feature in numerical_features:
                 # Compute quartiles
                 q = np.quantile(samples, [.25, .50, .75], interpolation='nearest')
                 decision_table_numerical.loc[feature, ['lower quartile', 'median', 'upper quartile']] = q
-
                 # Store median contribution
                 decision_table_numerical.loc[feature, 'contribution'] = np.median(contributions_for_decision_table[feature])
 
@@ -368,8 +326,9 @@ class TreeExplainer(object):
         # Sort decision table by contribution value
         decision_table_numerical.sort_values(by='contribution', ascending=False, inplace=True)
         decision_table_categorical.sort_values(by='contribution', ascending=False, inplace=True)
+        decision_table_categorical.drop(columns=['parent_feature'], inplace=True)
 
-        # Limit number of features used to explain this prediction
+        # Limit number of features used to explain_feature_contributions this prediction
         if threshold_contribution is not None:
             decision_table_numerical = decision_table_numerical.loc[decision_table_numerical['contribution'] >= threshold_contribution]
             decision_table_categorical = decision_table_categorical.loc[decision_table_categorical['contribution'] >= threshold_contribution]
@@ -381,85 +340,58 @@ class TreeExplainer(object):
         # Convert contribution column to string
         decision_table_numerical['contribution'] = decision_table_numerical['contribution'].map(fill_contribution_values)
         decision_table_categorical['contribution'] = decision_table_categorical['contribution'].map(fill_contribution_values)
+        # Convert other numerical columns to string
+        for feature in numerical_columns:
+            decision_table_numerical[feature] = decision_table_numerical[feature].map(fill_numerical_values)
 
         # Print to console
         with pd.option_context('display.max_rows', None, 'display.max_columns', None):
             outcome = self.target_data_type[self.target_name]['categories'][int(self.predictions[observation_idx])]
             is_correct = 'correct' if self.correct_predictions[observation_idx] else 'not correct'
             print('\nObservation #%i: %s = \'%s\' (%s)\n' % (observation_idx, self.target_name, outcome, is_correct))
-            print(decision_table_numerical)
-            print()
-            print(decision_table_categorical)
-            print()
+            if decision_table_numerical.shape[0] > 0:
+                print(decision_table_numerical)
+                print()
+            if decision_table_categorical.shape[0] > 0:
+                print(decision_table_categorical)
+                print()
 
 
-    def explain_correct_predictions(self):
-        print()
-
-
-    def _process_and_predict(self, data, targets=None, calling_method=None):
+    def _prepare_data_and_predict(self, data, targets=None):
         # Process input data
         DP = DataProcessor().prepare(data=data, targets=targets)
 
-        # Check what to do
-        did_have_data = self.data is not None
-        did_get_data = DP.data is not None
-
-        if did_get_data:
-            if did_have_data:
-                if np.array_equal(self.data, DP.data):
-                    return  # Passed the same data
-                else:
-                    pass  # Passed new data, which will overwrite previous data
-            else:
-                pass  # Passed new data, which will fill attributes `X` and `y`
-        else:
-            if did_have_data:
-                return  # No new data has been provided and there is data already
-            else:
-                raise ValueError('Please provide data and/or targets to the method %s()' % calling_method)
-
-        # Extract info
+        # Extract information on data
         self.data = DP.data
         self.n_samples = self.data.shape[0]
-        self.targets = DP.targets
         self.original_feature_names = DP.info['original_feature_names']
         self.feature_names = DP.info['feature_names']
         self.n_features = DP.info['n_features']
-        self.target_levels = DP.info['target_levels']
-        self.target_name = DP.info['target_name']
-        self.n_target_levels = DP.info['n_target_levels']
         self.features_data_types = DP.info['features_data_types']
-        self.target_data_type = DP.info['target_data_type']
 
-        # Initialize other attributes that depend on data
-        self.predictions = None
-        self.correct_predictions = None
-        self.contributions = None
-        self.conditional_contributions = None
-        self.feature_combinations = None
-        self.conditional_contributions_sample = None
-        self.data_leaves = None
-        self.min_depth_frame = None
-        self.min_depth_frame_summary = None
-        self.importance_frame = None
-        self.two_way_contribution_table = None
-        self.n_two_way_contribution_table = None
+        if targets is not None:
+            self.targets = DP.targets
+            self.n_target_levels = DP.info['n_target_levels']
+            self.target_name = DP.info['target_name']
+            self.target_levels = DP.info['target_levels']
+            self.target_data_type = DP.info['target_data_type']
+
+        else:  # some of these attributes can be inferred from the model
+            if self._model_specifics['implementation'] == 'sklearn' and \
+                    self._model_specifics['model_type'] == 'classifier':
+                self.n_target_levels = self.model.n_classes_
+            self.target_name = 'target'
+            self.targets = None
+            self.target_levels = None
 
         # Compute and store predictions
         self.prediction_probabilities = self.model.predict_proba(self.data)
-        if self._internals['model_type'] == 'classifier':
+        if self._model_specifics['model_type'] == 'classifier':
             self.predictions = np.argmax(self.prediction_probabilities, axis=1)
             if self.targets is not None:
                 self.correct_predictions = self.predictions == self.targets
         else:
             self.predictions = self.model.predict(self.data)
-
-        # Update feature names if they changed
-        if list(self.feature_depth.keys()) != self.feature_names:
-            self.feature_depth = dict({self.feature_names[idx]: value for idx, (_, value) in enumerate(self.feature_depth.items())})
-        if list(self.no_of_nodes.keys()) != self.feature_names:
-            self.no_of_nodes = dict({self.feature_names[idx]: value for idx, (_, value) in enumerate(self.no_of_nodes.items())})
 
 
     ############################################################################
@@ -563,7 +495,7 @@ class TreeExplainer(object):
         relative contribution of a feature when used at the root of the tree.
 
         Values are averaged across trees and observations in the data provided
-        to the explain_features() method.
+        to the explain_feature_contributions() method.
 
         If the model is a classifier, we can further  divide feature
         contributions between correct and incorrect predictions of the model,
@@ -587,8 +519,7 @@ class TreeExplainer(object):
         """
         # Compute conditional contributions if not previously done
         if self.conditional_contributions is None:
-            self.explain_interactions(data=None, targets=None,
-                                      n_jobs=n_jobs, verbose=verbose)
+            raise ValueError('First compute joint contributions')
 
         # Initialize temporary variables
         key_name = None
@@ -596,7 +527,7 @@ class TreeExplainer(object):
 
         # If the model is a classifier, separate contributions for correct and
         # incorrect predictions of the model
-        if self._internals['model_type'] == 'classifier':
+        if self._model_specifics['model_type'] == 'classifier':
             n_iterations = 3
         else:
             n_iterations = 1
@@ -610,7 +541,7 @@ class TreeExplainer(object):
                 key_name = 'all'
 
             else:
-                if self._internals['model_type'] == 'classifier':
+                if self._model_specifics['model_type'] == 'classifier':
                     if i_iter == 1:  # Select only correctly predictions samples
                         samples = np.where(self.targets == self.predictions)[0]
                         key_name = 'correct'
@@ -638,7 +569,7 @@ class TreeExplainer(object):
                                                                        self.conditional_contributions_sample[i_tree],
                                                                        self.features_split[i_tree],
                                                                        results, threading.Lock())
-                    for i_tree, estimator in enumerate(getattr(self.model, self._internals['estimators_'])))
+                    for i_tree, estimator in enumerate(getattr(self.model, self._model_specifics['estimators_'])))
 
             # Store values
             # Average interactions across all samples and trees. Combinations of
@@ -681,7 +612,7 @@ class TreeExplainer(object):
             self.compute_min_depth_distribution()
 
         # Initialize importance_frame
-        if self._internals['model_type'] == 'classifier':
+        if self._model_specifics['model_type'] == 'classifier':
             accuracy_column_name = 'accuracy_decrease'
             node_purity_column_name = 'gini_decrease'
         else:
@@ -951,7 +882,7 @@ class TreeExplainer(object):
             if isinstance(sort_features_on_target, str):
                 targets_to_plot = list([sort_features_on_target])
 
-            elif self._internals['model_type'] == 'classifier' and self.n_target_levels == 2:
+            elif self._model_specifics['model_type'] == 'classifier' and self.n_target_levels == 2:
                 # If this is a binary classification task, the contribution to each
                 # target will be identical, so we'll plot only one
                 targets_to_plot = list([self.target_levels[-1]])  # Assume that more interesting label is the highest
