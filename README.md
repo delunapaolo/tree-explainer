@@ -1,6 +1,5 @@
 # TreeExplainer
 
-
 Package for explaining and interpreting predictions of tree-based machine learning models. The notion of interpretability is based on how close the inclusion of a feature takes the model toward its final prediction. For this reason, the result of this approach is "feature contributions" to the predictions. 
 
 The basic idea is to decompose each prediction into feature contribution components. For a dataset with ``n`` features, each prediction on the dataset is calculated as
