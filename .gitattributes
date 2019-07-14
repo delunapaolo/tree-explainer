@@ -1,2 +1,1 @@
-*.py     text diff=python
-*.ipynb  text diff=python
+*.ipynb  linguist-generated=true
