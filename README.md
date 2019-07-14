@@ -91,6 +91,7 @@ treeinterpreter is generally faster because it doesn't calculate anything else.
 
 ELI5's implementation to compute feature contribution offers a beautiful output and supports other methods for interpretability. However, it lacks a method to automatically loop through a large dataset without creating its own, complex objects.
 
+For a comparison benchmark between these implementations, please refer to the [benchmark notebook](notebooks/benchmark.ipynb)
 
 # References
 ## Papers
