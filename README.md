@@ -1,6 +1,6 @@
 # TreeExplainer
 
-Package for explaining and interpreting predictions of tree-based machine learning models. The notion of interpretability is based on how close the inclusion of a feature takes the model toward its final prediction. For this reason, the result of this approach is "feature contributions" to the predictions. 
+TreeExplainer is a package for explaining and interpreting predictions of tree-based machine learning models. The notion of interpretability is based on how close the inclusion of a feature takes the model toward its final prediction. For this reason, the result of this approach is "feature contributions" to the predictions. 
 
 The basic idea is to decompose each prediction into feature contribution components. For a dataset with ``n`` features, each prediction on the dataset is calculated as
 
@@ -10,7 +10,7 @@ Feature contributions are provided at the level of observations, features, and t
 
 ## Implementation
 
-The class TreeExplainer encapsulates the tree-based model and accepts data on which to calculate feature contributions. It also offers several methods to generate reports, graphs and useful metrics. In particular, TreeExplainer offers the following:
+The class `TreeExplainer` encapsulates the tree-based model and accepts data on which to calculate feature contributions. It also offers several methods to generate reports, graphs and useful metrics. In particular, `TreeExplainer` offers the following:
 
 + Compute feature contributions on new data, for example, held-out data for validation or testing. [Other implementations do not offer this feature]
 + All operations performed on individual trees can be run in parallel.
@@ -37,7 +37,7 @@ In the near future, all ensemble methods in scikit-learn will be tested and supp
 
 ## Support for pandas and non-numerical data
 
-TreeExplainer fully supports data (and even targets) contained in pandas DataFrames. Categorical data (as specified by [pandas.CategoricalDataType](https://pandas.pydata.org/pandas-docs/stable/user_guide/categorical.html)) are welcome, too.
+`TreeExplainer` fully supports data (and even targets) contained in pandas DataFrames. Categorical data (as specified by [pandas.CategoricalDataType](https://pandas.pydata.org/pandas-docs/stable/user_guide/categorical.html)) are welcome, too.
 
 Column names are stored internally to be used in plots and reports. 
 
@@ -46,7 +46,7 @@ Non-numerical data is internally encoded to numerical either via one-hot encodin
     
 ## Dependencies
 
-The class TreeExplainer depends on:
+The class `TreeExplainer` depends on:
 
 + [scikit-learn](https://scikit-learn.org/) for modeling and validation
 + [numpy](https://www.numpy.org/) to calculate feature contributions
@@ -60,7 +60,7 @@ The class TreeExplainer depends on:
 
 Simply import the class and pass your trained model and some test data to it (either a numpy array or a pandas DataFrame):
 
-    from treeexplainer import TreeExplainer
+    from TreeExplainer import TreeExplainer
     TE = TreeExplainer(model, X_test)
     
 Available methods are
@@ -111,6 +111,4 @@ For a comparison benchmark between these implementations, please refer to the [b
 + Implement statistical and visualization features from R package [randomForestExplainer](https://mi2datalab.github.io/randomForestExplainer/), which are described [here for regression models](https://rawgit.com/MI2DataLab/randomForestExplainer/master/inst/doc/randomForestExplainer.html) and [here for classification tasks](https://rawgit.com/geneticsMiNIng/BlackBoxOpener/master/randomForestExplainer/inst/doc/randomForestExplainer.html).
 + Integrate [random-forest-importances](https://github.com/parrt/random-forest-importances) to compute drop-column and permutation importance.
 + Add agreement plots.
-+ Write notebooks to describe class features.
-+ Write notebooks for benchmarks versus treeexplainer and ELI5.
-
++ Document notebooks to describe class features.
