@@ -13,12 +13,9 @@ from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
 
 # Local repo
-from utilities.preprocessing import DataProcessor
-from utilities.model_validation import validate_model_type, validate_model_is_trained
-from utilities.parallel import compute_feature_contributions_from_tree
-from utilities.parallel import analyze_tree_structure
-from utilities.parallel import compute_two_way_conditional_contributions
-from utilities.parallel import compute_explanation_of_prediction
+from tree_explainer.utilities.preprocessing import DataProcessor
+from tree_explainer.utilities.model_validation import validate_model_type, validate_model_is_trained
+from tree_explainer.utilities.parallel import compute_feature_contributions_from_tree, analyze_tree_structure, compute_two_way_conditional_contributions, compute_explanation_of_prediction
 from tree_explainer.utilities.numerical import divide0
 from tree_explainer.utilities.visualization import adjust_spines
 from tree_explainer.utilities.lists import true_list
@@ -198,7 +195,7 @@ class TreeExplainer(object):
 
     def explain_single_prediction(self, observation_idx, solve_duplicate_splits='mean',
                                   threshold_contribution=None, top_n_features=None):
-        """Analyze tree structure and try to explain_feature_contributions how the model has reached a
+        """Analyze tree structure and try to explain how the model has reached a
         certain prediction for a single observation. The idea is to look at how
         each tree has used data features to partition the feature space, and
         how that rule generalizes across trees.
